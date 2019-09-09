@@ -32,7 +32,15 @@ from .modeling_utils import PreTrainedModel, prune_linear_layer
 from .configuration_bert import BertConfig
 from .file_utils import add_start_docstrings
 
+from torch.quantization import \
+    QuantWrapper, QuantStub, DeQuantStub, default_qconfig, per_channel_symmetric_weight_qconfig
+
+from torch.quantization import \
+    quantize, prepare, convert, prepare_qat, quantize_qat, fuse_modules
+
 logger = logging.getLogger(__name__)
+
+cur_qconfig = per_channel_symmetric_weight_qconfig #default_qconfig
 
 BERT_PRETRAINED_MODEL_ARCHIVE_MAP = {
     'bert-base-uncased': "https://s3.amazonaws.com/models.huggingface.co/bert/bert-base-uncased-pytorch_model.bin",
@@ -179,7 +187,9 @@ class BertSelfAttention(nn.Module):
                 "The hidden size (%d) is not a multiple of the number of attention "
                 "heads (%d)" % (config.hidden_size, config.num_attention_heads))
         self.output_attentions = config.output_attentions
-
+        self.qconfig = cur_qconfig #per_channel_symmetric_weight_qconfig  #default_qconfig
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub() 
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
@@ -196,10 +206,19 @@ class BertSelfAttention(nn.Module):
         return x.permute(0, 2, 1, 3)
 
     def forward(self, hidden_states, attention_mask, head_mask=None):
+        hidden_states = self.quant(hidden_states)
         mixed_query_layer = self.query(hidden_states)
         mixed_key_layer = self.key(hidden_states)
         mixed_value_layer = self.value(hidden_states)
 
+        mixed_query_layer = self.dequant(mixed_query_layer)
+        mixed_key_layer = self.dequant(mixed_key_layer)
+        mixed_value_layer = self.dequant(mixed_value_layer)
+
+        #mixed_query_layer = torch.reshape(mixed_query_layer, hidden_states.shape)
+        #mixed_key_layer = torch.reshape(mixed_key_layer, hidden_states.shape)
+        #mixed_value_layer = torch.reshape(mixed_value_layer, hidden_states.shape)   
+ 
         query_layer = self.transpose_for_scores(mixed_query_layer)
         key_layer = self.transpose_for_scores(mixed_key_layer)
         value_layer = self.transpose_for_scores(mixed_value_layer)
@@ -234,12 +253,18 @@ class BertSelfAttention(nn.Module):
 class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super(BertSelfOutput, self).__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.qconfig = cur_qconfig #per_channel_symmetric_weight_qconfig #default_qconfig
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size) 
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
+        hidden_states = self.quant(hidden_states)
         hidden_states = self.dense(hidden_states)
+        hidden_states = self.dequant(hidden_states)
+        #hidden_states = torch.reshape(hidden_states, input_tensor.shape)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
@@ -285,6 +310,9 @@ class BertAttention(nn.Module):
 class BertIntermediate(nn.Module):
     def __init__(self, config):
         super(BertIntermediate, self).__init__()
+        self.qconfig = cur_qconfig #per_channel_symmetric_weight_qconfig #default_qconfig
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
         self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
         if isinstance(config.hidden_act, str) or (sys.version_info[0] == 2 and isinstance(config.hidden_act, unicode)):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
@@ -292,7 +320,9 @@ class BertIntermediate(nn.Module):
             self.intermediate_act_fn = config.hidden_act
 
     def forward(self, hidden_states):
+        hidden_states = self.quant(hidden_states)
         hidden_states = self.dense(hidden_states)
+        hidden_states = self.dequant(hidden_states)
         hidden_states = self.intermediate_act_fn(hidden_states)
         return hidden_states
 
@@ -300,12 +330,22 @@ class BertIntermediate(nn.Module):
 class BertOutput(nn.Module):
     def __init__(self, config):
         super(BertOutput, self).__init__()
+
+        #quantization 
+        self.qconfig = cur_qconfig  #per_channel_symmetric_weight_qconfig #default_qconfig  
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
+ 
+        
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
+        hidden_states = self.quant(hidden_states)
         hidden_states = self.dense(hidden_states)
+        hidden_states = self.dequant(hidden_states)
+        #hidden_states = torch.reshape(hidden_states,input_tensor.shape)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
@@ -362,14 +402,21 @@ class BertEncoder(nn.Module):
 class BertPooler(nn.Module):
     def __init__(self, config):
         super(BertPooler, self).__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        
+        self.qconfig = cur_qconfig#per_channel_symmetric_weight_qconfig #default_qconfig
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
+        self.dense = (nn.Linear(config.hidden_size, config.hidden_size))
+        #self.dense.qconfig = default_qconfig
         self.activation = nn.Tanh()
 
     def forward(self, hidden_states):
         # We "pool" the model by simply taking the hidden state corresponding
         # to the first token.
         first_token_tensor = hidden_states[:, 0]
+        first_token_tensor = self.quant(first_token_tensor)
         pooled_output = self.dense(first_token_tensor)
+        pooled_output = self.dequant(pooled_output)
         pooled_output = self.activation(pooled_output)
         return pooled_output
 

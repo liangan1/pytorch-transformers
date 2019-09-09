@@ -31,6 +31,9 @@ from torch.utils.data.distributed import DistributedSampler
 from tensorboardX import SummaryWriter
 from tqdm import tqdm, trange
 
+from torch.quantization import \
+    quantize, prepare, convert, prepare_qat, quantize_qat, fuse_modules
+
 from pytorch_transformers import (WEIGHTS_NAME, BertConfig,
                                   BertForSequenceClassification, BertTokenizer,
                                   RobertaConfig,
@@ -117,10 +120,13 @@ def train(args, train_dataset, model, tokenizer):
     logger.info("  Total optimization steps = %d", t_total)
 
     global_step = 0
+    total_step = args.num_train_epochs * int ((len(train_dataset) + args.per_gpu_train_batch_size - 1) / args.per_gpu_train_batch_size)
+    logger.info("  total_step = %d", total_step)
     tr_loss, logging_loss = 0.0, 0.0
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
+   
     for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
@@ -152,18 +158,19 @@ def train(args, train_dataset, model, tokenizer):
                 optimizer.step()
                 model.zero_grad()
                 global_step += 1
-
+                #print(global_step)
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Log metrics
                     if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
                         results = evaluate(args, model, tokenizer)
+                        #acc = results['acc']
                         for key, value in results.items():
                             tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
                     tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
                     tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
                     logging_loss = tr_loss
 
-                if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
+                if args.local_rank in [-1, 0]  and args.save_steps > 0 and  np.allclose(global_step,total_step, atol=2*args.save_steps):  
                     # Save model checkpoint
                     output_dir = os.path.join(args.output_dir, 'checkpoint-{}'.format(global_step))
                     if not os.path.exists(output_dir):
@@ -185,8 +192,7 @@ def train(args, train_dataset, model, tokenizer):
 
     return global_step, tr_loss / global_step
 
-
-def evaluate(args, model, tokenizer, prefix=""):
+def evaluate(args, model, tokenizer, prefix="", calibation = False, samples_rate = 1):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
     eval_outputs_dirs = (args.output_dir, args.output_dir + '-MM') if args.task_name == "mnli" else (args.output_dir,)
@@ -197,12 +203,12 @@ def evaluate(args, model, tokenizer, prefix=""):
 
         if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
             os.makedirs(eval_output_dir)
-
+        
         args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
         # Note that DistributedSampler samples randomly
         eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
         eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
-
+        calibation_iteration =  int((len(eval_dataset) * 0.06 + args.eval_batch_size - 1) / args.eval_batch_size)
         # Eval!
         logger.info("***** Running evaluation {} *****".format(prefix))
         logger.info("  Num examples = %d", len(eval_dataset))
@@ -213,6 +219,9 @@ def evaluate(args, model, tokenizer, prefix=""):
         out_label_ids = None
         for batch in tqdm(eval_dataloader, desc="Evaluating"):
             model.eval()
+            if calibation and nb_eval_steps >= calibation_iteration:
+                break
+            #   continue
             batch = tuple(t.to(args.device) for t in batch)
 
             with torch.no_grad():
@@ -231,8 +240,10 @@ def evaluate(args, model, tokenizer, prefix=""):
             else:
                 preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
                 out_label_ids = np.append(out_label_ids, inputs['labels'].detach().cpu().numpy(), axis=0)
-
-        eval_loss = eval_loss / nb_eval_steps
+        if calibation:
+           eval_loss = eval_loss / (nb_eval_steps)
+        else:
+           eval_loss = eval_loss / (nb_eval_steps)
         if args.output_mode == "classification":
             preds = np.argmax(preds, axis=1)
         elif args.output_mode == "regression":
@@ -301,6 +312,11 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
     dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
     return dataset
 
+
+def print_model(module):
+    print(type(module))
+    for child in module.children():
+       print_model(child)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -482,9 +498,16 @@ def main():
         logger.info("Evaluate the following checkpoints: %s", checkpoints)
         for checkpoint in checkpoints:
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
+  
             model = model_class.from_pretrained(checkpoint)
             model.to(args.device)
-            result = evaluate(args, model, tokenizer, prefix=global_step)
+            prepare(model)
+            result = evaluate(args, model, tokenizer, prefix=global_step, calibation = True)
+            convert(model)
+            
+            with torch.autograd.profiler.profile() as prof:
+                result = evaluate(args, model, tokenizer, prefix=global_step)
+            print(prof.key_averages().table(sort_by="cpu_time_total"))
             result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
             results.update(result)
 
