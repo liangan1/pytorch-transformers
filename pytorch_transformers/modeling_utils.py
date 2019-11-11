@@ -29,7 +29,7 @@ import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from torch.nn import functional as F
-
+from torch.quantization import prepare, convert
 from .file_utils import cached_path
 
 logger = logging.getLogger(__name__)
@@ -443,7 +443,7 @@ class PreTrainedModel(nn.Module):
         force_download = kwargs.pop('force_download', False)
         proxies = kwargs.pop('proxies', None)
         output_loading_info = kwargs.pop('output_loading_info', False)
-
+        run_quantized_model = kwargs.pop('run_quantized_model', False)
         # Load config
         if config is None:
             config, model_kwargs = cls.config_class.from_pretrained(
@@ -495,13 +495,40 @@ class PreTrainedModel(nn.Module):
 
         # Instantiate model.
         model = cls(config, *model_args, **model_kwargs)
-
+        if run_quantized_model:
+           prepare(model, inplace = True)
+           convert(model, inplace = True)
         if state_dict is None and not from_tf:
             state_dict = torch.load(resolved_archive_file, map_location='cpu')
         if from_tf:
             # Directly load from a TensorFlow checkpoint
             return cls.load_tf_weights(model, config, resolved_archive_file[:-6])  # Remove the '.index'
-
+        
+        for key in list(state_dict.keys()):
+            if 'query.weight' in key:
+                mixed_weights = state_dict[key] 
+                state_dict.pop(key)
+            elif 'query.bia' in key:
+                mixed_bias = state_dict[key]
+                state_dict.pop(key)
+            elif 'key.weight' in key: 
+                mixed_weights = torch.cat((mixed_weights, state_dict[key]), dim=0)
+                state_dict.pop(key)
+            elif 'key.bia' in key:
+                mixed_bias = torch.cat((mixed_bias, state_dict[key]), dim=0)
+                state_dict.pop(key)
+            elif 'value.weight' in key:
+                mixed_weights = torch.cat((mixed_weights, state_dict[key]), dim=0)
+                state_dict.pop(key)
+                key = key.replace('value', 'mixed')
+                state_dict[key] = mixed_weights
+            elif 'value.bia' in key:
+                mixed_bias = torch.cat((mixed_bias, state_dict[key]), dim=0)
+                state_dict.pop(key)
+                key = key.replace('value', 'mixed')
+                state_dict[key] = mixed_bias
+                
+            
         # Convert old format to new format if needed from a PyTorch state_dict
         old_keys = []
         new_keys = []

@@ -31,7 +31,16 @@ from torch.nn import CrossEntropyLoss, MSELoss
 from .modeling_utils import (WEIGHTS_NAME, CONFIG_NAME, PretrainedConfig, PreTrainedModel,
                              prune_linear_layer, add_start_docstrings)
 
+from torch.quantization import \
+    QuantWrapper, QuantStub, DeQuantStub, default_qconfig, default_per_channel_qconfig
+
+from torch.quantization import \
+    quantize, prepare, convert, prepare_qat, quantize_qat, fuse_modules
+
 logger = logging.getLogger(__name__)
+
+cur_qconfig = default_qconfig
+
 
 BERT_PRETRAINED_MODEL_ARCHIVE_MAP = {
     'bert-base-uncased': "https://s3.amazonaws.com/models.huggingface.co/bert/bert-base-uncased-pytorch_model.bin",
@@ -146,7 +155,7 @@ def swish(x):
     return x * torch.sigmoid(x)
 
 
-ACT2FN = {"gelu": gelu, "relu": torch.nn.functional.relu, "swish": swish}
+ACT2FN = {"gelu": torch.nn.functional.gelu, "relu": torch.nn.functional.relu, "swish": swish}
 
 
 class BertConfig(PretrainedConfig):
@@ -219,26 +228,26 @@ class BertConfig(PretrainedConfig):
                              " or the path to a pretrained model config file (str)")
 
 
-
-try:
-    from apex.normalization.fused_layer_norm import FusedLayerNorm as BertLayerNorm
-except (ImportError, AttributeError) as e:
-    logger.info("Better speed can be achieved with apex installed from https://www.github.com/nvidia/apex .")
-    class BertLayerNorm(nn.Module):
-        def __init__(self, hidden_size, eps=1e-12):
-            """Construct a layernorm module in the TF style (epsilon inside the square root).
-            """
-            super(BertLayerNorm, self).__init__()
-            self.weight = nn.Parameter(torch.ones(hidden_size))
-            self.bias = nn.Parameter(torch.zeros(hidden_size))
-            self.variance_epsilon = eps
-
-        def forward(self, x):
-            u = x.mean(-1, keepdim=True)
-            s = (x - u).pow(2).mean(-1, keepdim=True)
-            x = (x - u) / torch.sqrt(s + self.variance_epsilon)
-            return self.weight * x + self.bias
-
+BertLayerNorm = torch.nn.LayerNorm
+#try:
+#    from apex.normalization.fused_layer_norm import FusedLayerNorm as BertLayerNorm
+#except (ImportError, AttributeError) as e:
+#    logger.info("Better speed can be achieved with apex installed from https://www.github.com/nvidia/apex .")
+#    class BertLayerNorm(nn.Module):
+#        def __init__(self, hidden_size, eps=1e-12):
+#            """Construct a layernorm module in the TF style (epsilon inside the square root).
+#            """
+#            super(BertLayerNorm, self).__init__()
+#            self.weight = nn.Parameter(torch.ones(hidden_size))
+#            self.bias = nn.Parameter(torch.zeros(hidden_size))
+#            self.variance_epsilon = eps
+#
+#        def forward(self, x):
+#            u = x.mean(-1, keepdim=True)
+#            s = (x - u).pow(2).mean(-1, keepdim=True)
+#            x = (x - u) / torch.sqrt(s + self.variance_epsilon)
+#            return self.weight * x + self.bias
+#
 class BertEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings.
     """
@@ -279,14 +288,17 @@ class BertSelfAttention(nn.Module):
                 "The hidden size (%d) is not a multiple of the number of attention "
                 "heads (%d)" % (config.hidden_size, config.num_attention_heads))
         self.output_attentions = config.output_attentions
-
+        self.qconfig = cur_qconfig 
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub() 
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
-
-        self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        
+        #self.query = nn.Linear(config.hidden_size, self.all_head_size)
+        #self.key = nn.Linear(config.hidden_size, self.all_head_size)
+        #self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        self.mixed = nn.Linear(config.hidden_size, 3 * self.all_head_size)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
@@ -296,10 +308,19 @@ class BertSelfAttention(nn.Module):
         return x.permute(0, 2, 1, 3)
 
     def forward(self, hidden_states, attention_mask, head_mask=None):
-        mixed_query_layer = self.query(hidden_states)
-        mixed_key_layer = self.key(hidden_states)
-        mixed_value_layer = self.value(hidden_states)
-
+        hidden_states = self.quant(hidden_states)
+        mixed_layer = self.mixed(hidden_states)
+        mixed_layer = self.dequant(mixed_layer)
+        mixed_layer = torch.chunk(mixed_layer, 3, dim = 2)
+        mixed_query_layer = mixed_layer[0]
+        mixed_key_layer = mixed_layer[1]
+        mixed_value_layer = mixed_layer[2] 
+        #mixed_query_layer = self.query(hidden_states)
+        #mixed_key_layer = self.key(hidden_states)
+        #mixed_value_layer = self.value(hidden_states)
+        #mixed_query_layer = self.dequant(mixed_query_layer)
+        #mixed_key_layer = self.dequant(mixed_key_layer)
+        #mixed_value_layer = self.dequant(mixed_value_layer)
         query_layer = self.transpose_for_scores(mixed_query_layer)
         key_layer = self.transpose_for_scores(mixed_key_layer)
         value_layer = self.transpose_for_scores(mixed_value_layer)
@@ -334,12 +355,17 @@ class BertSelfAttention(nn.Module):
 class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super(BertSelfOutput, self).__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.qconfig = cur_qconfig #per_channel_symmetric_weight_qconfig #default_qconfig
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size) 
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
+        hidden_states = self.quant(hidden_states)
         hidden_states = self.dense(hidden_states)
+        hidden_states = self.dequant(hidden_states)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
@@ -378,6 +404,9 @@ class BertAttention(nn.Module):
 class BertIntermediate(nn.Module):
     def __init__(self, config):
         super(BertIntermediate, self).__init__()
+        self.qconfig = cur_qconfig #per_channel_symmetric_weight_qconfig #default_qconfig
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
         self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
         if isinstance(config.hidden_act, str) or (sys.version_info[0] == 2 and isinstance(config.hidden_act, unicode)):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
@@ -385,7 +414,9 @@ class BertIntermediate(nn.Module):
             self.intermediate_act_fn = config.hidden_act
 
     def forward(self, hidden_states):
+        hidden_states = self.quant(hidden_states)
         hidden_states = self.dense(hidden_states)
+        hidden_states = self.dequant(hidden_states)
         hidden_states = self.intermediate_act_fn(hidden_states)
         return hidden_states
 
@@ -393,12 +424,21 @@ class BertIntermediate(nn.Module):
 class BertOutput(nn.Module):
     def __init__(self, config):
         super(BertOutput, self).__init__()
+
+        #quantization 
+        self.qconfig = cur_qconfig  #per_channel_symmetric_weight_qconfig #default_qconfig  
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
+ 
+        
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
+        hidden_states = self.quant(hidden_states)
         hidden_states = self.dense(hidden_states)
+        hidden_states = self.dequant(hidden_states)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
@@ -433,7 +473,6 @@ class BertEncoder(nn.Module):
         for i, layer_module in enumerate(self.layer):
             if self.output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
-
             layer_outputs = layer_module(hidden_states, attention_mask, head_mask[i])
             hidden_states = layer_outputs[0]
 
@@ -455,14 +494,20 @@ class BertEncoder(nn.Module):
 class BertPooler(nn.Module):
     def __init__(self, config):
         super(BertPooler, self).__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        
+        self.qconfig = cur_qconfig#per_channel_symmetric_weight_qconfig #default_qconfig
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
+        self.dense = (nn.Linear(config.hidden_size, config.hidden_size))
         self.activation = nn.Tanh()
 
     def forward(self, hidden_states):
         # We "pool" the model by simply taking the hidden state corresponding
         # to the first token.
         first_token_tensor = hidden_states[:, 0]
+        first_token_tensor = self.quant(first_token_tensor)
         pooled_output = self.dense(first_token_tensor)
+        pooled_output = self.dequant(pooled_output)
         pooled_output = self.activation(pooled_output)
         return pooled_output
 
@@ -960,10 +1005,12 @@ class BertForSequenceClassification(BertPreTrainedModel):
     def __init__(self, config):
         super(BertForSequenceClassification, self).__init__(config)
         self.num_labels = config.num_labels
-
         self.bert = BertModel(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
         self.classifier = nn.Linear(config.hidden_size, self.config.num_labels)
+        self.qconfig = cur_qconfig
 
         self.apply(self.init_weights)
 
@@ -974,8 +1021,9 @@ class BertForSequenceClassification(BertPreTrainedModel):
         pooled_output = outputs[1]
 
         pooled_output = self.dropout(pooled_output)
+        pooled_output = self.quant(pooled_output)
         logits = self.classifier(pooled_output)
-
+        logits = self.dequant(logits)
         outputs = (logits,) + outputs[2:]  # add hidden states and attention if they are here
 
         if labels is not None:

@@ -45,11 +45,13 @@ export $KMP_SETTING
 echo -e "### using OMP_NUM_THREADS=$TOTAL_CORES"
 echo -e "### using $KMP_SETTING"
 echo -e "### using ARGS=$ARGS\n"
+for task in "QNLI"
+do
 
-GLUE_DIR=./dataset/glue_data
-TASK_NAME=MRPC
+GLUE_DIR=~/glue_data
+TASK_NAME=${task}
 
-OUTPUT=${TASK_NAME}_output
+OUTPUT=${GLUE_DIR}/weights/${TASK_NAME}_output
 if [[ -d "$OUTPUT" ]]; then
   echo "### using model file from $OUTPUT"
 else
@@ -58,14 +60,16 @@ else
 fi
 
 $PREFIX python ./examples/run_glue.py --model_type bert \
-    --model_name_or_path bert-base-uncased \
-    --task_name MRPC \
+    --model_name_or_path bert-large-uncased \
+    --task_name ${TASK_NAME} \
     --do_eval \
     --do_lower_case \
+    --do_fp32_inference \
+    --do_int8_inference \
     --data_dir $GLUE_DIR/$TASK_NAME/ \
     --max_seq_length 128 \
     --per_gpu_eval_batch_size $BATCH_SIZE \
     --no_cuda \
     --output_dir $OUTPUT $ARGS
-
-echo -e "\n### samples/sec = batch_size * it/s\n### batch_size = $BATCH_SIZE"
+done
+#echo -e "\n### samples/sec = batch_size * it/s\n### batch_size = $BATCH_SIZE"

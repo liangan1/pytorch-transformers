@@ -22,7 +22,7 @@ import glob
 import logging
 import os
 import random
-
+import timeit
 import numpy as np
 import torch
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
@@ -45,6 +45,9 @@ from pytorch_transformers import AdamW, WarmupLinearSchedule
 
 from utils_glue import (compute_metrics, convert_examples_to_features,
                         output_modes, processors)
+
+from torch.quantization import \
+    prepare, convert
 
 logger = logging.getLogger(__name__)
 
@@ -115,14 +118,16 @@ def train(args, train_dataset, model, tokenizer):
                    args.train_batch_size * args.gradient_accumulation_steps * (torch.distributed.get_world_size() if args.local_rank != -1 else 1))
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %d", t_total)
-
+    logger.info(" steps per epoch = %d", (len(train_dataset) + args.per_gpu_train_batch_size - 1) // args.per_gpu_train_batch_size )
     global_step = 0
+    step_per_epoch = 0
     tr_loss, logging_loss = 0.0, 0.0
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
     for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+        step_per_epoch += (len(train_dataset) + args.per_gpu_train_batch_size - 1) // args.per_gpu_train_batch_size
         for step, batch in enumerate(epoch_iterator):
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
@@ -163,7 +168,7 @@ def train(args, train_dataset, model, tokenizer):
                     tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
                     logging_loss = tr_loss
 
-                if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
+                if args.local_rank in [-1, 0] and args.save_steps > 0 and np.allclose(global_step, step_per_epoch, atol=args.logging_steps * 2) and global_step % args.save_steps == 0:
                     # Save model checkpoint
                     output_dir = os.path.join(args.output_dir, 'checkpoint-{}'.format(global_step))
                     if not os.path.exists(output_dir):
@@ -179,14 +184,14 @@ def train(args, train_dataset, model, tokenizer):
         if args.max_steps > 0 and global_step > args.max_steps:
             train_iterator.close()
             break
-
+        
     if args.local_rank in [-1, 0]:
         tb_writer.close()
 
     return global_step, tr_loss / global_step
 
 
-def evaluate(args, model, tokenizer, prefix=""):
+def evaluate(args, model, tokenizer, prefix="", calibration = False):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
     eval_outputs_dirs = (args.output_dir, args.output_dir + '-MM') if args.task_name == "mnli" else (args.output_dir,)
@@ -197,12 +202,15 @@ def evaluate(args, model, tokenizer, prefix=""):
 
         if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
             os.makedirs(eval_output_dir)
-
-        args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
+        if calibration:
+           args.eval_batch_size = 16
+        else:
+           args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
         # Note that DistributedSampler samples randomly
         eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
+           
         eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
-
+        calibation_iteration =  int((len(eval_dataset) * 0.05 + args.eval_batch_size - 1) / args.eval_batch_size)
         # Eval!
         logger.info("***** Running evaluation {} *****".format(prefix))
         logger.info("  Num examples = %d", len(eval_dataset))
@@ -216,11 +224,12 @@ def evaluate(args, model, tokenizer, prefix=""):
             from torch.utils import mkldnn as mkldnn_utils
             model = mkldnn_utils.to_mkldnn(model)
             print(model)
-
+          
         for batch in tqdm(eval_dataloader, desc="Evaluating"):
             model.eval()
             batch = tuple(t.to(args.device) for t in batch)
-
+            if calibration and nb_eval_steps >= calibation_iteration:
+                break
             with torch.no_grad():
                 inputs = {'input_ids':      batch[0],
                           'attention_mask': batch[1],
@@ -307,7 +316,6 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
     dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
     return dataset
 
-
 def main():
     parser = argparse.ArgumentParser()
 
@@ -322,6 +330,7 @@ def main():
                         help="The name of the task to train selected in the list: " + ", ".join(processors.keys()))
     parser.add_argument("--output_dir", default=None, type=str, required=True,
                         help="The output directory where the model predictions and checkpoints will be written.")
+        
 
     ## Other parameters
     parser.add_argument("--config_name", default="", type=str,
@@ -333,8 +342,14 @@ def main():
     parser.add_argument("--max_seq_length", default=128, type=int,
                         help="The maximum total input sequence length after tokenization. Sequences longer "
                              "than this will be truncated, sequences shorter will be padded.")
+    parser.add_argument("--do_fp32_inference", action='store_true',
+                        help="Whether to run fp32 inference.")
     parser.add_argument("--do_train", action='store_true',
                         help="Whether to run training.")
+    parser.add_argument("--do_calibration", action='store_true',
+                        help="Whether to do calibration.")
+    parser.add_argument("--do_int8_inference", action='store_true',
+                        help="Whether to run int8 inference.")
     parser.add_argument("--do_eval", action='store_true',
                         help="Whether to run eval on the dev set.")
     parser.add_argument("--evaluate_during_training", action='store_true',
@@ -390,7 +405,6 @@ def main():
     parser.add_argument('--server_ip', type=str, default='', help="For distant debugging.")
     parser.add_argument('--server_port', type=str, default='', help="For distant debugging.")
     args = parser.parse_args()
-
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
 
@@ -487,13 +501,42 @@ def main():
             checkpoints = list(os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
             logging.getLogger("pytorch_transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
         logger.info("Evaluate the following checkpoints: %s", checkpoints)
+       
         for checkpoint in checkpoints:
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
-            model = model_class.from_pretrained(checkpoint)
-            model.to(args.device)
-            result = evaluate(args, model, tokenizer, prefix=global_step)
-            result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
-            results.update(result)
+            logger.info("Evaluate:" + args.task_name)
+            if args.do_fp32_inference:
+               model = model_class.from_pretrained(checkpoint)
+               model.to(args.device)               
+               with torch.autograd.profiler.profile() as prof:
+                  result = evaluate(args, model, tokenizer, prefix=global_step)
+                  result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
+                  results.update(result)
+               print(prof.key_averages().table(sort_by="cpu_time_total"))
+            
+            if args.do_calibration:
+               model = model_class.from_pretrained(checkpoint)
+               model.to(args.device)               
+               prepare(model, inplace = True)
+               result = evaluate(args, model, tokenizer, prefix=global_step, calibration = True)
+               convert(model, inplace = True)
+               quantized_model_path = args.output_dir+"/quantized_model"
+               if not os.path.exists(quantized_model_path):
+                        os.makedirs(quantized_model_path)
+               model.save_pretrained(quantized_model_path)
+            if args.do_int8_inference:
+                quantized_model_path = args.output_dir+"/quantized_model"
+                if not os.path.exists(quantized_model_path):
+                        logger.error("please do calibrantion befor run int8 inference")
+                        exit()
+                model = model_class.from_pretrained(quantized_model_path, run_quantized_model=True)
+                model.to(args.device)
+                with torch.autograd.profiler.profile() as prof:
+                     result = evaluate(args, model, tokenizer, prefix=global_step)
+                print(prof.key_averages().table(sort_by="cpu_time_total"))
+
+                result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
+                results.update(result)
 
     return results
 
