@@ -508,11 +508,11 @@ def main():
             if args.do_fp32_inference:
                model = model_class.from_pretrained(checkpoint)
                model.to(args.device)               
-               with torch.autograd.profiler.profile() as prof:
-                  result = evaluate(args, model, tokenizer, prefix=global_step)
-                  result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
-                  results.update(result)
-               print(prof.key_averages().table(sort_by="cpu_time_total"))
+               #with torch.autograd.profiler.profile() as prof:
+               result = evaluate(args, model, tokenizer, prefix=global_step)
+               result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
+               results.update(result)
+               #print(prof.key_averages().table(sort_by="cpu_time_total"))
             
             if args.do_calibration:
                model = model_class.from_pretrained(checkpoint)
@@ -531,9 +531,9 @@ def main():
                         exit()
                 model = model_class.from_pretrained(quantized_model_path, run_quantized_model=True)
                 model.to(args.device)
-                with torch.autograd.profiler.profile() as prof:
-                     result = evaluate(args, model, tokenizer, prefix=global_step)
-                print(prof.key_averages().table(sort_by="cpu_time_total"))
+                #with torch.autograd.profiler.profile() as prof:
+                result = evaluate(args, model, tokenizer, prefix=global_step)
+                #print(prof.key_averages().table(sort_by="cpu_time_total"))
 
                 result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
                 results.update(result)

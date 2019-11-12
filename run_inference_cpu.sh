@@ -15,39 +15,29 @@
 ###   ./run_inference_cpu.sh --single --mkldnn (realtime)
 
 
-CORES=`lscpu | grep Core | awk '{print $4}'`
-SOCKETS=`lscpu | grep Socket | awk '{print $2}'`
-TOTAL_CORES=`expr $CORES \* $SOCKETS`
+NUM_CORES=`lscpu | grep Core | awk '{print $4}'`
+NUM_THREAD=$NUM_CORES
+NUM_NUMA=$((`lscpu | grep 'NUMA node(s)'|awk '{print $3}' ` - 1))
+export KMP_AFFINITY=granularity=fine,noduplicates,compact,1,0
 
-KMP_SETTING="KMP_AFFINITY=granularity=fine,compact,1,0"
-
-
-PREFIX=""
 ARGS=""
 BATCH_SIZE=8
 if [[ "$1" == "--single" ]]; then
   echo "### using single batch size"
   BATCH_SIZE=1
-  TOTAL_CORES=4
-  LAST_CORE=`expr $TOTAL_CORES - 1`
-  PREFIX="numactl --physcpubind=0-$LAST_CORE --membind=0"
+  NUM_THREAD=4
   shift
 fi
-
 if [[ "$1" == "--mkldnn" ]]; then
   echo "### using mkldnn"
   ARGS="--mkldnn"
 fi
 
-export OMP_NUM_THREADS=$TOTAL_CORES
-export $KMP_SETTING
-
-echo -e "### using OMP_NUM_THREADS=$TOTAL_CORES"
-echo -e "### using $KMP_SETTING"
+echo -e "### using OMP_NUM_THREADS=$NUM_THREAD"
+echo -e "### using $KMP_AFFINITY"
 echo -e "### using ARGS=$ARGS\n"
-for task in "QNLI"
+for task in "QNLI" 
 do
-
 GLUE_DIR=~/glue_data
 TASK_NAME=${task}
 
@@ -58,18 +48,29 @@ else
   echo -e "\n### model file not found, run fune tune first!\n###  ./run_training_gpu.sh\n"
   exit
 fi
-
-$PREFIX python ./examples/run_glue.py --model_type bert \
-    --model_name_or_path bert-large-uncased \
-    --task_name ${TASK_NAME} \
-    --do_eval \
-    --do_lower_case \
-    --do_fp32_inference \
-    --do_int8_inference \
-    --data_dir $GLUE_DIR/$TASK_NAME/ \
-    --max_seq_length 128 \
-    --per_gpu_eval_batch_size $BATCH_SIZE \
-    --no_cuda \
-    --output_dir $OUTPUT $ARGS
+INT_PER_NODE=$(($NUM_CORES / $NUM_THREAD - 1 ))
+for i in $(seq 0 $NUM_NUMA)
+do
+for j in $(seq 0 $INT_PER_NODE)
+do
+    startid=$(($i*$NUM_CORES+$j*$NUM_THREAD))
+    endid=$(($i*$NUM_CORES+$j*$NUM_THREAD+$NUM_THREAD-1))
+    OMP_NUM_THREADS=$NUM_THREAD numactl --physcpubind=$startid-$endid --membind=$i \
+    python ./examples/run_glue.py --model_type bert \
+        --model_name_or_path bert-large-uncased \
+        --task_name ${TASK_NAME} \
+        --do_eval \
+        --do_lower_case \
+        --do_int8_inference \
+        --data_dir $GLUE_DIR/$TASK_NAME/ \
+        --max_seq_length 128 \
+        --per_gpu_eval_batch_size $BATCH_SIZE \
+        --no_cuda \
+        --output_dir $OUTPUT $ARGS 2>&1|tee ${TASK_NAME}_batch_size_${BATCH_SIZE}_instance$(($i*($INT_PER_NODE+1)+$j)).log& 
+    
 done
+done
+
+done
+
 #echo -e "\n### samples/sec = batch_size * it/s\n### batch_size = $BATCH_SIZE"
