@@ -36,11 +36,14 @@ fi
 echo -e "### using OMP_NUM_THREADS=$NUM_THREAD"
 echo -e "### using $KMP_AFFINITY"
 echo -e "### using ARGS=$ARGS\n"
-for task in "QNLI" 
+for task in "WNLI" 
 do
 GLUE_DIR=/lustre/dataset/glue_data
 TASK_NAME=${task}
-
+LOG_DIR=$TASK_NAME"_LOG"
+if [ ! -d $LOG_DIR ];then
+   mkdir $LOG_DIR
+fi
 OUTPUT=${GLUE_DIR}/weights/${TASK_NAME}_output
 if [[ -d "$OUTPUT" ]]; then
   echo "### using model file from $OUTPUT"
@@ -66,7 +69,7 @@ do
         --max_seq_length 128 \
         --per_gpu_eval_batch_size $BATCH_SIZE \
         --no_cuda \
-        --output_dir $OUTPUT $ARGS 2>&1|tee ${TASK_NAME}_batch_size_${BATCH_SIZE}_instance$(($i*($INT_PER_NODE+1)+$j)).log& 
+        --output_dir $OUTPUT $ARGS 2>&1|tee $LOG_DIR/${TASK_NAME}_batch_size_${BATCH_SIZE}_instance$(($i*($INT_PER_NODE+1)+$j)).log& 
     
 done
 done

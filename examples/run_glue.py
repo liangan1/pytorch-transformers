@@ -520,12 +520,12 @@ def main():
                prepare(model, inplace = True)
                result = evaluate(args, model, tokenizer, prefix=global_step, calibration = True)
                convert(model, inplace = True)
-               quantized_model_path = args.output_dir+"/quantized_model"
+               quantized_model_path = args.task_name + "_quantized_model"
                if not os.path.exists(quantized_model_path):
                         os.makedirs(quantized_model_path)
                model.save_pretrained(quantized_model_path)
             if args.do_int8_inference:
-                quantized_model_path = args.output_dir+"/quantized_model"
+                quantized_model_path = args.task_name + "_quantized_model"
                 if not os.path.exists(quantized_model_path):
                         logger.error("please do calibrantion befor run int8 inference")
                         exit()
