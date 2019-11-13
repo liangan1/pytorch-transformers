@@ -47,7 +47,7 @@ echo -e "### using ARGS=$ARGS\n"
 for task in "QNLI" "MRPC" 
 do
 
-GLUE_DIR=~/glue_data
+GLUE_DIR=/lustre/dataset/glue_data
 TASK_NAME=${task}
 
 OUTPUT=${GLUE_DIR}/weights/${TASK_NAME}_output/
@@ -64,7 +64,6 @@ $PREFIX python ./examples/run_glue.py --model_type bert \
     --do_eval \
     --do_lower_case \
     --do_calibration \
-    --do_int8_inference \
     --data_dir $GLUE_DIR/$TASK_NAME/ \
     --max_seq_length 128 \
     --per_gpu_eval_batch_size $BATCH_SIZE \
