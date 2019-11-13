@@ -38,7 +38,7 @@ echo -e "### using $KMP_AFFINITY"
 echo -e "### using ARGS=$ARGS\n"
 for task in "QNLI" 
 do
-GLUE_DIR=~/glue_data
+GLUE_DIR=/lustre/dataset/glue_data
 TASK_NAME=${task}
 LOG_DIR=$TASK_NAME"_LOG"
 if [ ! -d $LOG_DIR ];then
