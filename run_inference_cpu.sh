@@ -21,7 +21,7 @@ NUM_NUMA=$((`lscpu | grep 'NUMA node(s)'|awk '{print $3}' ` - 1))
 export KMP_AFFINITY=granularity=fine,noduplicates,compact,1,0
 
 ARGS=""
-BATCH_SIZE=8
+BATCH_SIZE=16
 if [[ "$1" == "--single" ]]; then
   echo "### using single batch size"
   BATCH_SIZE=1
@@ -36,9 +36,9 @@ fi
 echo -e "### using OMP_NUM_THREADS=$NUM_THREAD"
 echo -e "### using $KMP_AFFINITY"
 echo -e "### using ARGS=$ARGS\n"
-for task in "WNLI" 
+for task in "QNLI" 
 do
-GLUE_DIR=/lustre/dataset/glue_data
+GLUE_DIR=~/glue_data
 TASK_NAME=${task}
 LOG_DIR=$TASK_NAME"_LOG"
 if [ ! -d $LOG_DIR ];then

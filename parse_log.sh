@@ -8,7 +8,7 @@ NUM_THREAD=$NUM_CORES
 NUM_NUMA=$((`lscpu | grep 'NUMA node(s)'|awk '{print $3}' ` - 1))
 THOUPUT=0
 LATENCY=0
-BATCH_SIZE=8
+BATCH_SIZE=16
 
 if [[ "$1" == "--single" ]]; then
   echo "### using single batch size"
