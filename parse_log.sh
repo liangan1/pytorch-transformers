@@ -6,8 +6,6 @@
 NUM_CORES=`lscpu | grep Core | awk '{print $4}'`
 NUM_THREAD=$NUM_CORES
 NUM_NUMA=$((`lscpu | grep 'NUMA node(s)'|awk '{print $3}' ` - 1))
-THOUPUT=0
-LATENCY=0
 BATCH_SIZE=16
 
 if [[ "$1" == "--single" ]]; then
@@ -20,6 +18,8 @@ fi
 for task in "QNLI" "MRPC"
 do
    TASK_NAME=${task}
+   THOUPUT=0
+   LATENCY=0
    LOG_DIR=$TASK_NAME"_LOG"
    echo "task:" $TASK_NAME
    echo "batch_size:" $BATCH_SIZE
