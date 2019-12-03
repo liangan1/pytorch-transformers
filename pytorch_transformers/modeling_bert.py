@@ -23,7 +23,7 @@ import math
 import os
 import sys
 from io import open
-
+import numpy 
 import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss, MSELoss
@@ -32,14 +32,14 @@ from .modeling_utils import (WEIGHTS_NAME, CONFIG_NAME, PretrainedConfig, PreTra
                              prune_linear_layer, add_start_docstrings)
 
 from torch.quantization import \
-    QuantWrapper, QuantStub, DeQuantStub, default_qconfig, default_per_channel_qconfig
+    QuantWrapper, QuantStub, DeQuantStub, default_qconfig, default_per_channel_qconfig, default_histogram_qconfig
 
 from torch.quantization import \
     quantize, prepare, convert, prepare_qat, quantize_qat, fuse_modules
 
 logger = logging.getLogger(__name__)
 
-cur_qconfig = default_qconfig
+cur_qconfig = default_per_channel_qconfig
 
 
 BERT_PRETRAINED_MODEL_ARCHIVE_MAP = {
@@ -311,6 +311,9 @@ class BertSelfAttention(nn.Module):
         hidden_states = self.quant(hidden_states)
         mixed_layer = self.mixed(hidden_states)
         mixed_layer = self.dequant(mixed_layer)
+        if self.save_tensor and not self.already_saved:
+            numpy.save(self.layer_name, mixed_layer)
+            self.already_saved = True
         mixed_layer = torch.chunk(mixed_layer, 3, dim = 2)
         mixed_query_layer = mixed_layer[0]
         mixed_key_layer = mixed_layer[1]
@@ -367,6 +370,9 @@ class BertSelfOutput(nn.Module):
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dequant(hidden_states)
         hidden_states = self.dropout(hidden_states)
+        if self.save_tensor and  not self.already_saved:
+           numpy.save(self.layer_name, hidden_states)
+           self.already_saved = True
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
@@ -417,6 +423,9 @@ class BertIntermediate(nn.Module):
         hidden_states = self.quant(hidden_states)
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dequant(hidden_states)
+        if self.save_tensor and not self.already_saved:        
+            numpy.save(self.layer_name, hidden_states)
+            self.already_saved = True
         hidden_states = self.intermediate_act_fn(hidden_states)
         return hidden_states
 
@@ -429,7 +438,6 @@ class BertOutput(nn.Module):
         self.qconfig = cur_qconfig  #per_channel_symmetric_weight_qconfig #default_qconfig  
         self.quant = QuantStub()
         self.dequant = DeQuantStub()
- 
         
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -439,6 +447,9 @@ class BertOutput(nn.Module):
         hidden_states = self.quant(hidden_states)
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dequant(hidden_states)
+        if self.save_tensor and  not self.already_saved:
+           numpy.save(self.layer_name, hidden_states)
+           self.already_saved = True
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
@@ -1007,10 +1018,10 @@ class BertForSequenceClassification(BertPreTrainedModel):
         self.num_labels = config.num_labels
         self.bert = BertModel(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.quant = QuantStub()
-        self.dequant = DeQuantStub()
+        #self.quant = QuantStub()
+        #self.dequant = DeQuantStub()
         self.classifier = nn.Linear(config.hidden_size, self.config.num_labels)
-        self.qconfig = cur_qconfig
+        #self.qconfig = cur_qconfig
 
         self.apply(self.init_weights)
 
@@ -1021,9 +1032,9 @@ class BertForSequenceClassification(BertPreTrainedModel):
         pooled_output = outputs[1]
 
         pooled_output = self.dropout(pooled_output)
-        pooled_output = self.quant(pooled_output)
+        #pooled_output = self.quant(pooled_output)
         logits = self.classifier(pooled_output)
-        logits = self.dequant(logits)
+        #logits = self.dequant(logits)
         outputs = (logits,) + outputs[2:]  # add hidden states and attention if they are here
 
         if labels is not None:

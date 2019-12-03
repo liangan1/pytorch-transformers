@@ -48,6 +48,8 @@ from utils_glue import (compute_metrics, convert_examples_to_features,
 
 from torch.quantization import \
     prepare, convert
+from torch.quantization import \
+    QuantWrapper, QuantStub, DeQuantStub, default_qconfig, default_per_channel_qconfig, default_histogram_qconfig
 
 logger = logging.getLogger(__name__)
 
@@ -316,6 +318,18 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
     dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
     return dataset
 
+def fallback_layers(model, layers=[], prefix=""):
+    if prefix in layers:
+       model.qconfig = None
+       print(prefix)
+       for name, sub_model in list(model.named_children()):
+           if "dequant" in name or "quant" in name:
+               model._modules[name] = torch.nn.Identity()
+
+    for name, sub_model in list(model.named_children()):
+       fallback_layers(sub_model, layers, prefix + name + ".")
+
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -404,6 +418,7 @@ def main():
                         help="For distributed training: local_rank")
     parser.add_argument('--server_ip', type=str, default='', help="For distant debugging.")
     parser.add_argument('--server_port', type=str, default='', help="For distant debugging.")
+    parser.add_argument('--metric', type=str, default="acc", help="For metric name return from your evaluate function")
     args = parser.parse_args()
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
@@ -501,39 +516,134 @@ def main():
             checkpoints = list(os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
             logging.getLogger("pytorch_transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
         logger.info("Evaluate the following checkpoints: %s", checkpoints)
-       
+
+        def add_layer_name(model, layer_name="", save_tensor = False):
+            model.layer_name=layer_name
+            model.save_tensor = save_tensor
+            model.already_saved = False
+            for name, sub_model in model.named_children():
+                add_layer_name(sub_model, layer_name + name + ".", save_tensor)
+
+        def mse_metric_gap(fp32_tensor, int8_dequantize_tensor):
+            fp32_max  = numpy.max(fp32_tensor)
+            fp32_min  = numpy.min(fp32_tensor)
+            int8_dequantize_max = numpy.max(int8_dequantize_tensor)
+            int8_dequantize_min = numpy.min(int8_dequantize_tensor)
+            fp32_tensor = (fp32_tensor - fp32_min) / (fp32_max - fp32_min)
+            int8_dequantize_tensor = (int8_dequantize_tensor - int8_dequantize_min) / (int8_dequantize_max - int8_dequantize_min)
+            diff_tensor = fp32_tensor - int8_dequantize_tensor
+            euclidean_dist = numpy.sum(diff_tensor ** 2)
+            return euclidean_dist/fp32_tensor.size
+
+        def exculde_layer(model, layer_name="", exculde_layers={}):
+            if layer_name in exculde_layers and  not exculde_layers[layer_name]:
+               print(layer_name)
+               model.qconfig = None
+               for name, sub_model in list(model.named_children()):
+                  if "dequant" in name or "quant" in name:
+                      model._modules[name] = torch.nn.Identity()
+            for name, sub_model in list(model.named_children()):
+                exculde_layer(sub_model, layer_name + name + ".", exculde_layers)
+
+ 
+        from math import log2
+        # calculate the kl divergence
+        def kl_divergence(p, q):
+            p = p.flatten()**2
+            q = q.flatten()**2
+            elsilon=0.0000001
+            return sum(p[i] * log2((p[i]+elsilon)/(q[i]+elsilon)) for i in range(len(p)))
+ 
+        def compute_fp32_and_int8_dequantize_gap(model, layer_name="", layer_gap_dict={}):
+            fp32_file = layer_name+".npy"
+            int8_dequantize_file = "dequantize." + layer_name+".npy"
+            if os.path.exists(fp32_file) and os.path.exists(int8_dequantize_file):
+                print(layer_name)
+                fp32_tensor = numpy.load(fp32_file)
+                int8_dequantize_tensor = numpy.load(int8_dequantize_file)
+                gap = mse_metric_gap(fp32_tensor, int8_dequantize_tensor)
+                layer_gap_dict.update({layer_name:gap})
+            for name, sub_model in model.named_children():
+                compute_fp32_and_int8_dequantize_gap(sub_model, layer_name + name + ".", layer_gap_dict)
+ 
         for checkpoint in checkpoints:
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
             logger.info("Evaluate:" + args.task_name)
+            fp32_metric = 0.0
+            int8_metric = 0.0
             if args.do_fp32_inference:
                model = model_class.from_pretrained(checkpoint)
-               model.to(args.device)               
+               model.to(args.device)
+               layer_gap_dict = {}
+               #import numpy
+               #compute_fp32_and_int8_dequantize_gap(model, "", layer_gap_dict)
+               #sorted_gap = sorted(layer_gap_dict.items(), key=lambda item:item[1], reverse=True)
+               #for item in sorted_gap:
+               #    print(item)
+               #break 
+               add_layer_name(model, "", True)
                #with torch.autograd.profiler.profile() as prof:
                result = evaluate(args, model, tokenizer, prefix=global_step)
+               fp32_metric = result[args.metric]
                result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
                results.update(result)
                #print(prof.key_averages().table(sort_by="cpu_time_total"))
             
             if args.do_calibration:
                model = model_class.from_pretrained(checkpoint)
-               model.to(args.device)               
-               prepare(model, inplace = True)
-               result = evaluate(args, model, tokenizer, prefix=global_step, calibration = True)
-               convert(model, inplace = True)
+               add_layer_name(model, "calibration", False)
+               model.to(args.device)         
+               import copy
+               model_tmp = copy.deepcopy(model) 
+               prepare(model_tmp, inplace = True)
+               result = evaluate(args, model_tmp, tokenizer, prefix=global_step, calibration = True)
+               convert(model_tmp, inplace = True)
+               args.eval_batch_size = 50
+               add_layer_name(model_tmp, "dequantize.", True)
+               result = evaluate(args, model_tmp, tokenizer, prefix=global_step)
+               int8_metric = result[args.metric]
+               count = 0
+               exculde_layers = {}
+               layer_gap_dict = {}
+               import numpy
+               compute_fp32_and_int8_dequantize_gap(model, "", layer_gap_dict)
+               sorted_gap = sorted(layer_gap_dict.items(), key=lambda item:item[1], reverse=True)
+               for item in sorted_gap:
+                   print(item)
+               cur_int8_metric = int8_metric
+               pre_int8_metric = int8_metric
+               len_gap_dict = len(layer_gap_dict)
+               while cur_int8_metric < fp32_metric * 0.99 and count < len_gap_dict:
+                   model_tmp = copy.deepcopy(model)
+                   exculde_layers.update({sorted_gap[count % len_gap_dict][0]:False})
+                   exculde_layer(model_tmp, "", exculde_layers)
+                   prepare(model_tmp, inplace = True)
+                   add_layer_name(model_tmp, "calibration", False)
+                   result = evaluate(args, model_tmp, tokenizer, prefix=global_step, calibration = True)
+                   convert(model_tmp, inplace = True)
+                   add_layer_name(model_tmp, "dequantize.", False)
+                   result = evaluate(args, model_tmp, tokenizer, prefix=global_step)
+                   cur_int8_metric=result[args.metric]
+                   if cur_int8_metric > pre_int8_metric:
+                      pre_int8_metric = cur_int8_metric
+                   else:
+                      del exculde_layers[sorted_gap[count][0]]
+                   count += 1
                quantized_model_path = args.task_name + "_quantized_model"
                if not os.path.exists(quantized_model_path):
                         os.makedirs(quantized_model_path)
-               model.save_pretrained(quantized_model_path)
+               model_tmp.save_pretrained(quantized_model_path)
             if args.do_int8_inference:
                 quantized_model_path = args.task_name + "_quantized_model"
                 if not os.path.exists(quantized_model_path):
                         logger.error("please do calibrantion befor run int8 inference")
                         exit()
+                #fallback_layers(model_class, )
                 model = model_class.from_pretrained(quantized_model_path, run_quantized_model=True)
                 model.to(args.device)
-                #with torch.autograd.profiler.profile() as prof:
-                result = evaluate(args, model, tokenizer, prefix=global_step)
-                #print(prof.key_averages().table(sort_by="cpu_time_total"))
+                with torch.autograd.profiler.profile() as prof:
+                  result = evaluate(args, model, tokenizer, prefix=global_step)
+                print(prof.key_averages().table(sort_by="cpu_time_total"))
 
                 result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
                 results.update(result)
