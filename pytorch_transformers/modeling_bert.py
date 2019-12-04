@@ -39,7 +39,7 @@ from torch.quantization import \
 
 logger = logging.getLogger(__name__)
 
-cur_qconfig = default_qconfig
+cur_qconfig = default_per_channel_qconfig #default_qconfig
 
 
 BERT_PRETRAINED_MODEL_ARCHIVE_MAP = {
