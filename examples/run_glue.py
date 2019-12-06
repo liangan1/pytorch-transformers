@@ -47,7 +47,7 @@ from utils_glue import (compute_metrics, convert_examples_to_features,
                         output_modes, processors)
 
 from torch.quantization import \
-    prepare, convert
+    prepare, convert, prepare_qat
 
 logger = logging.getLogger(__name__)
 
@@ -348,6 +348,10 @@ def main():
                         help="Whether to run training.")
     parser.add_argument("--do_calibration", action='store_true',
                         help="Whether to do calibration.")
+    parser.add_argument("--do_qat", action='store_true',
+                        help="Whether to do QAT.")
+    parser.add_argument("--qat_evaluation", action='store_true',
+                        help="Whether to do QAT.")
     parser.add_argument("--do_int8_inference", action='store_true',
                         help="Whether to run int8 inference.")
     parser.add_argument("--do_eval", action='store_true',
@@ -467,7 +471,19 @@ def main():
     # Training
     if args.do_train:
         train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
+        if args.do_qat:
+           print("Before Trainning")
+           prepare_qat(model, inplace=True)
         global_step, tr_loss = train(args, train_dataset, model, tokenizer)
+        if args.do_qat:
+           qat_model = convert(model,inplace=False)
+           print("after Training")
+           print(qat_model)
+           result = evaluate(args, qat_model, tokenizer, prefix="")
+           qat_quantized_model_path = args.task_name + "_qat_quantized_model"
+           if not os.path.exists(qat_quantized_model_path):
+                  os.makedirs(qat_quantized_model_path)
+           qat_model.save_pretrained(qat_quantized_model_path)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
 
@@ -505,6 +521,17 @@ def main():
         for checkpoint in checkpoints:
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
             logger.info("Evaluate:" + args.task_name)
+            if args.qat_evaluation:
+               qat_quantized_model_path = args.task_name + "_qat_quantized_model"
+               if not os.path.exists(qat_quantized_model_path):
+                        logger.error("please do qat  befor run qat_evaluation int8 inference")
+                        exit()
+
+               model = model_class.from_pretrained(qat_quantized_model_path, qat_eval=True)
+               model.to(args.device)
+               print(model)
+               result = evaluate(args, model, tokenizer, prefix=global_step)
+
             if args.do_fp32_inference:
                model = model_class.from_pretrained(checkpoint)
                model.to(args.device)               
@@ -513,7 +540,6 @@ def main():
                result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
                results.update(result)
                #print(prof.key_averages().table(sort_by="cpu_time_total"))
-            
             if args.do_calibration:
                model = model_class.from_pretrained(checkpoint)
                model.to(args.device)               

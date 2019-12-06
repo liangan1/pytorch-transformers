@@ -15,7 +15,7 @@
 NUM_GPUS=`python -c "import torch;print(torch.cuda.device_count())"`
 [ $NUM_GPUS -gt 1 ] && echo -e "\n### the script run multi gpus by default, use your judgement wisedly!\n"
 
-GLUE_DIR=./dataset/glue_data
+GLUE_DIR=~/glue_data
 TASK_NAME=MRPC
 
 BATCH_SIZE=8 # default bs
@@ -23,10 +23,12 @@ OUTPUT=${TASK_NAME}_output
 [ -d "$OUTPUT" ] || mkdir $OUTPUT
 
 python ./examples/run_glue.py --model_type bert \
-    --model_name_or_path bert-base-uncased \
+    --model_name_or_path bert-large-uncased \
     --task_name MRPC \
     --do_eval \
     --do_train \
+    --do_qat \
+    --qat_evaluation \
     --do_lower_case \
     --data_dir $GLUE_DIR/$TASK_NAME/ \
     --max_seq_length 128 \
@@ -34,5 +36,5 @@ python ./examples/run_glue.py --model_type bert \
     --per_gpu_train_batch_size $BATCH_SIZE \
     --save_steps 400 \
     --learning_rate 2e-5 \
-    --num_train_epochs 1.0 \
+    --num_train_epochs 3.0 \
     --output_dir $OUTPUT

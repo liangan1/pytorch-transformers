@@ -29,7 +29,7 @@ import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from torch.nn import functional as F
-from torch.quantization import prepare, convert
+from torch.quantization import prepare, convert, prepare_qat
 from .file_utils import cached_path
 
 logger = logging.getLogger(__name__)
@@ -444,6 +444,7 @@ class PreTrainedModel(nn.Module):
         proxies = kwargs.pop('proxies', None)
         output_loading_info = kwargs.pop('output_loading_info', False)
         run_quantized_model = kwargs.pop('run_quantized_model', False)
+        qat_eval = kwargs.pop('qat_eval', False)
         # Load config
         if config is None:
             config, model_kwargs = cls.config_class.from_pretrained(
@@ -497,6 +498,9 @@ class PreTrainedModel(nn.Module):
         model = cls(config, *model_args, **model_kwargs)
         if run_quantized_model:
            prepare(model, inplace = True)
+           convert(model, inplace = True)
+        if qat_eval:
+           prepare_qat(model, inplace = True)
            convert(model, inplace = True)
         if state_dict is None and not from_tf:
             state_dict = torch.load(resolved_archive_file, map_location='cpu')

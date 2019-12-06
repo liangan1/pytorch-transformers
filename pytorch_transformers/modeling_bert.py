@@ -32,14 +32,14 @@ from .modeling_utils import (WEIGHTS_NAME, CONFIG_NAME, PretrainedConfig, PreTra
                              prune_linear_layer, add_start_docstrings)
 
 from torch.quantization import \
-    QuantWrapper, QuantStub, DeQuantStub, default_qconfig, default_per_channel_qconfig
+    QuantWrapper, QuantStub, DeQuantStub, default_qat_qconfig, default_per_channel_qconfig
 
 from torch.quantization import \
     quantize, prepare, convert, prepare_qat, quantize_qat, fuse_modules
 
 logger = logging.getLogger(__name__)
 
-cur_qconfig = default_per_channel_qconfig #default_qconfig
+cur_qconfig = default_qat_qconfig
 
 
 BERT_PRETRAINED_MODEL_ARCHIVE_MAP = {
