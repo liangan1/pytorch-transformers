@@ -163,7 +163,7 @@ def train(args, train_dataset, model, tokenizer):
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Log metrics
                     if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
-                        results = evaluate(args, model, tokenizer)
+                        results = evaluate(model, args)
                         for key, value in results.items():
                             tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
                     tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
@@ -193,14 +193,14 @@ def train(args, train_dataset, model, tokenizer):
     return global_step, tr_loss / global_step
 
 
-def evaluate(args, model, tokenizer, prefix="", calibration = False):
+def evaluate(model, args):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
     eval_outputs_dirs = (args.output_dir, args.output_dir + '-MM') if args.task_name == "mnli" else (args.output_dir,)
 
     results = {}
     for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
-        eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, evaluate=True)
+        eval_dataset = load_and_cache_examples(args, eval_task, args.tokenizer, evaluate=True)
 
         if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
             os.makedirs(eval_output_dir)
@@ -214,7 +214,7 @@ def evaluate(args, model, tokenizer, prefix="", calibration = False):
         eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
         calibation_iteration =  int((len(eval_dataset) * 0.05 + args.eval_batch_size - 1) / args.eval_batch_size)
         # Eval!
-        logger.info("***** Running evaluation {} *****".format(prefix))
+        logger.info("***** Running evaluation {} *****".format(args.prefix))
         logger.info("  Num examples = %d", len(eval_dataset))
         logger.info("  Batch size = %d", args.eval_batch_size)
         eval_loss = 0.0
@@ -230,7 +230,7 @@ def evaluate(args, model, tokenizer, prefix="", calibration = False):
         for batch in tqdm(eval_dataloader, desc="Evaluating"):
             model.eval()
             batch = tuple(t.to(args.device) for t in batch)
-            if calibration and nb_eval_steps >= calibation_iteration:
+            if args.do_calibration and nb_eval_steps >= calibation_iteration:
                 break
             with torch.no_grad():
                 inputs = {'input_ids':      batch[0],
@@ -365,9 +365,8 @@ class SaveTensorObserver(torch.quantization.observer._ObserverBase):
     The module is mainly for debug and records the tensor values during runtime.
 
     Args:
-        dtype: Quantized data type
-        qscheme: Quantization scheme to be used
-        reduce_range: Reduces the range of the quantized data type by 1 bit
+        layer_name: model layer name format is : xxx.xxx.xxx
+        saved: flag to save, only save the first one batch tensor 
     """
     def __init__(self, layer_name = ""):
         super(SaveTensorObserver, self).__init__()
@@ -423,6 +422,14 @@ def add_save_observer_(module, prefix = "", fallback_op_types=DEFAULT_QUANTIZED_
         module.register_forward_hook(_observer_forward_hook)
 
 def mse_metric_gap(fp32_tensor, int8_dequantize_tensor):
+    r"""
+        caculate the euclidean distance between 
+        fp32 tensor and int8 dequantize tensor     
+
+    Args:
+        fp32_tensr: 
+        int8_dequantize_tensor:
+    """
     fp32_max  = numpy.max(fp32_tensor)
     fp32_min  = numpy.min(fp32_tensor)
     int8_dequantize_max = numpy.max(int8_dequantize_tensor)
@@ -434,6 +441,16 @@ def mse_metric_gap(fp32_tensor, int8_dequantize_tensor):
     return euclidean_dist/fp32_tensor.size
 
 def fallback_layer(model, layer_name="", exculde_layers={}):
+    r"""
+    force layers in exculde_layers bucket to be fp32 op, the model 
+    should be add qconfig and QuantWrapper already
+
+    Args:
+        model: a fp32 model with qconfig information 
+        layer_name: model layer name format is : xxx.xxx.xxx
+        : flag to save, only save the first one batch tensor
+    """
+
     for name, sub_model in list(model.named_children()):
         sub_model_layer_name = layer_name + name + "."
         if sub_model_layer_name in exculde_layers:
@@ -444,6 +461,15 @@ def fallback_layer(model, layer_name="", exculde_layers={}):
                fallback_layer(sub_sub_model, sub_model_layer_name, exculde_layers)
 
 def compute_fp32_and_int8_dequantize_gap(model, layer_name="", layer_gap_dict={}):
+    r"""
+    load FP32_tesor and int8_dequantize_tensor, then compute the distance between
+    the distance one by one.
+
+    Args:
+        layer_name: model layer name format is : xxx.xxx.xxx
+        layer_gap_dict: a dict to save {layer_name: distance} 
+    """
+
     fp32_file = "FP32_tesor/" + layer_name + ".npy"
     int8_dequantize_file = "INT8_tesor/" + layer_name+".npy"
     if os.path.exists(fp32_file) and os.path.exists(int8_dequantize_file):
@@ -456,6 +482,19 @@ def compute_fp32_and_int8_dequantize_gap(model, layer_name="", layer_gap_dict={}
            compute_fp32_and_int8_dequantize_gap(sub_model, layer_name + name + ".", layer_gap_dict)
 
 def save_quantized_model(model, fallback_layers, save_directory="quantized_model", save_config = False):
+    r"""
+    save quantized model info:
+    1) fallback_layer info 
+    2) configuration if need, sunch bert model
+    3) quantized_model state_dict
+
+    Args:
+        model: quantized model
+        fallback_layers: layers force to be fp32 op
+        save_directory:  directory to save model info 
+        save_config: if need to save configuration information         
+    """
+
     if not os.path.exists(save_directory):
        os.mkdir(save_directory)
     assert os.path.isdir(save_directory), "Saving path should be a directory where the model and configuration can be saved"
@@ -476,11 +515,34 @@ def save_quantized_model(model, fallback_layers, save_directory="quantized_model
     qconfig_file = os.path.join(save_directory, "pytorch_model.bin")
     torch.save(model_to_save.state_dict(), output_model_file)
 
-def quantization_auto_tuning(model, run_fn, test_data=None, calibration_data=None,
-                             metric = "acc", relative_error = 0.01, 
+def quantization_auto_tuning(model, run_fn, run_args, run_calibration, 
+                             calibration_args, metric = "top-1", relative_error = 0.01, 
                              absolute_error = 0.01, relative_err_master = True,
                              fallback_op_types=DEFAULT_QUANTIZED_OP):
+    r"""
+    The auto-tuning tool API for user.
 
+    Args:
+        model:    the model should already be prepared by first two steps in  
+        run_fn:   evaluation function, the return should be {accuracy_metric:value}
+                  for example, {"acc": 0.62}
+        run_args: this is the args of evaluation function, recommond using 
+                  the type of parser.parse_args()
+        run_calibration: calibration function 
+        calibration_args: the args for calibration function 
+        metric:   the accuracy metric, such as: acc, f1, mcc, top-1, map and so.
+        relative_error: the maximum torlerance ratio of relative error btween fp32 model
+                        and quantized model, the default value is 0.01 (1%)                        
+        absolute_error: the maximum torlerance ratio of absolute error btween fp32 model
+                        and quantized model, the default value is 0.01 (1%)
+        relative_err_master: whether relative_error or absolute_error is import for you
+        fallback_op_types: which type quantized op should be auto-tuing fallback, there
+                           are generally several diffrent quantized op in the quantized  
+                           model, sometimes, you just want to fallback some types not all types.  
+                           for example: conv/linear are in a CV model, you just want to fallback 
+                           linear, then fallback_op_types={nnq.Linear}
+
+    """
     #run fp32 evaluation to collect accuracy and fp32 tensor
     model_tmp = copy.deepcopy(model)
     propagate_qconfig_(model_tmp)
@@ -743,6 +805,7 @@ def main():
 
     # Evaluation
     results = {}
+    args.tokenizer = tokenizer
     if args.do_eval and args.local_rank in [-1, 0]:
         checkpoints = [args.output_dir]
         if args.eval_all_checkpoints:
@@ -750,113 +813,15 @@ def main():
             logging.getLogger("pytorch_transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
         logger.info("Evaluate the following checkpoints: %s", checkpoints)
 
-        def add_layer_name(model, layer_name="", save_tensor = False):
-            model.layer_name=layer_name
-            model.save_tensor = save_tensor
-            model.already_saved = False
-            for name, sub_model in model.named_children():
-                add_layer_name(sub_model, layer_name + name + ".", save_tensor)
-
- 
-        from math import log2
-        # calculate the kl divergence
-        def kl_divergence(p, q):
-            p = p.flatten()**2
-            q = q.flatten()**2
-            elsilon=0.0000001
-            return sum(p[i] * log2((p[i]+elsilon)/(q[i]+elsilon)) for i in range(len(p)))
- 
- 
         for checkpoint in checkpoints:
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
             logger.info("Evaluate:" + args.task_name)
-            fp32_metric = 0.0
-            int8_metric = 0.0
-            if args.do_fp32_inference:
-               model = model_class.from_pretrained(checkpoint)
-               model.to(args.device)
-               import copy
-               model_test = copy.deepcopy(model)
-               propagate_qconfig_(model_test)
-               print(model_test)
-               add_save_observer_(model_test)
-               print(model_test)
-               layer_gap_dict = {}
-               #import numpy
-               #compute_fp32_and_int8_dequantize_gap(model, "", layer_gap_dict)
-               #sorted_gap = sorted(layer_gap_dict.items(), key=lambda item:item[1], reverse=True)
-               #for item in sorted_gap:
-               #    print(item)
-               #break 
-               add_layer_name(model, "", True)
-               #with torch.autograd.profiler.profile() as prof:
-               result = evaluate(args, model_test, tokenizer, prefix=global_step)
-               fp32_metric = result[args.metric]
-               result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
-               results.update(result)
-               #print(prof.key_averages().table(sort_by="cpu_time_total"))
-            
-            if args.do_calibration:
-               model = model_class.from_pretrained(checkpoint)
-               add_layer_name(model, "calibration", False)
-               model.to(args.device)         
-               import copy
-               model_tmp = copy.deepcopy(model) 
-               prepare(model_tmp, inplace = True)
-               result = evaluate(args, model_tmp, tokenizer, prefix=global_step, calibration = True)
-               convert(model_tmp, inplace = True)
-               args.eval_batch_size = 50
-               add_layer_name(model_tmp, "dequantize.", True)
-               result = evaluate(args, model_tmp, tokenizer, prefix=global_step)
-               int8_metric = result[args.metric]
-               count = 0
-               exculde_layers = {}
-               layer_gap_dict = {}
-               import numpy
-               compute_fp32_and_int8_dequantize_gap(model, "", layer_gap_dict)
-               sorted_gap = sorted(layer_gap_dict.items(), key=lambda item:item[1], reverse=True)
-               for item in sorted_gap:
-                   print(item)
-               cur_int8_metric = int8_metric
-               pre_int8_metric = int8_metric
-               len_gap_dict = len(layer_gap_dict)
-               while cur_int8_metric < fp32_metric * 0.99 and count < len_gap_dict:
-                   model_tmp = copy.deepcopy(model)
-                   exculde_layers.update({sorted_gap[count % len_gap_dict][0]:False})
-                   exculde_layer(model_tmp, "", exculde_layers)
-                   prepare(model_tmp, inplace = True)
-                   add_layer_name(model_tmp, "calibration", False)
-                   result = evaluate(args, model_tmp, tokenizer, prefix=global_step, calibration = True)
-                   convert(model_tmp, inplace = True)
-                   add_layer_name(model_tmp, "dequantize.", False)
-                   result = evaluate(args, model_tmp, tokenizer, prefix=global_step)
-                   cur_int8_metric=result[args.metric]
-                   if cur_int8_metric > pre_int8_metric:
-                      pre_int8_metric = cur_int8_metric
-                   else:
-                      del exculde_layers[sorted_gap[count][0]]
-                   count += 1
-               quantized_model_path = args.task_name + "_quantized_model"
-               if not os.path.exists(quantized_model_path):
-                        os.makedirs(quantized_model_path)
-               model_tmp.save_pretrained(quantized_model_path)
-            if args.do_int8_inference:
-                quantized_model_path = args.task_name + "_quantized_model"
-                if not os.path.exists(quantized_model_path):
-                        logger.error("please do calibrantion befor run int8 inference")
-                        exit()
-                #fallback_layers(model_class, )
-                model = model_class.from_pretrained(quantized_model_path, run_quantized_model=True)
-                model.to(args.device)
-                with torch.autograd.profiler.profile() as prof:
-                  result = evaluate(args, model, tokenizer, prefix=global_step)
-                print(prof.key_averages().table(sort_by="cpu_time_total"))
-
-                result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
-                results.update(result)
-
-    return results
-
+            model = model_class.from_pretrained(checkpoint)
+            model.to(args.device)
+            run_args = copy.deepcopy(args)
+            run_args.do_calibration = False
+            calibration_args = args   
+             
 
 if __name__ == "__main__":
     main()
