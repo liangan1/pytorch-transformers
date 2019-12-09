@@ -32,7 +32,7 @@ from .modeling_utils import (WEIGHTS_NAME, CONFIG_NAME, PretrainedConfig, PreTra
                              prune_linear_layer, add_start_docstrings)
 
 from torch.quantization import \
-    QuantWrapper, QuantStub, DeQuantStub, default_qconfig, default_per_channel_qconfig, default_histogram_qconfig
+    QuantWrapper, QuantStub, DeQuantStub, default_qconfig, default_per_channel_qconfig
 
 from torch.quantization import \
     quantize, prepare, convert, prepare_qat, quantize_qat, fuse_modules
@@ -311,9 +311,6 @@ class BertSelfAttention(nn.Module):
         hidden_states = self.quant(hidden_states)
         mixed_layer = self.mixed(hidden_states)
         mixed_layer = self.dequant(mixed_layer)
-        if self.save_tensor and not self.already_saved:
-            numpy.save(self.layer_name, mixed_layer)
-            self.already_saved = True
         mixed_layer = torch.chunk(mixed_layer, 3, dim = 2)
         mixed_query_layer = mixed_layer[0]
         mixed_key_layer = mixed_layer[1]
@@ -370,9 +367,6 @@ class BertSelfOutput(nn.Module):
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dequant(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        if self.save_tensor and  not self.already_saved:
-           numpy.save(self.layer_name, hidden_states)
-           self.already_saved = True
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
@@ -423,9 +417,6 @@ class BertIntermediate(nn.Module):
         hidden_states = self.quant(hidden_states)
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dequant(hidden_states)
-        if self.save_tensor and not self.already_saved:        
-            numpy.save(self.layer_name, hidden_states)
-            self.already_saved = True
         hidden_states = self.intermediate_act_fn(hidden_states)
         return hidden_states
 
@@ -447,9 +438,6 @@ class BertOutput(nn.Module):
         hidden_states = self.quant(hidden_states)
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dequant(hidden_states)
-        if self.save_tensor and  not self.already_saved:
-           numpy.save(self.layer_name, hidden_states)
-           self.already_saved = True
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states

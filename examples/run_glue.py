@@ -47,9 +47,9 @@ from utils_glue import (compute_metrics, convert_examples_to_features,
                         output_modes, processors)
 
 from torch.quantization import \
-    prepare, convert
+    prepare, convert, propagate_qconfig_
 from torch.quantization import \
-    QuantWrapper, QuantStub, DeQuantStub, default_qconfig, default_per_channel_qconfig, default_histogram_qconfig
+    QuantWrapper, QuantStub, DeQuantStub, default_qconfig, default_per_channel_qconfig
 
 logger = logging.getLogger(__name__)
 
@@ -318,17 +318,207 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
     dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
     return dataset
 
-def fallback_layers(model, layers=[], prefix=""):
-    if prefix in layers:
+from torch.quantization.quantize import _observer_forward_hook
+import torch.nn.intrinsic.quantized as nniq
+import torch.nn.quantized as nnq
+DEFAULT_QUANTIZED_OP = {
+    nnq.Linear,
+    nnq.ReLU,
+    nnq.ReLU6,
+    nnq.Conv2d,
+    # Wrapper Modules:
+    nnq.QFunctional,
+    # Intrinsic modules:
+    nniq.ConvReLU2d,
+    nniq.LinearReLU,
+    nniq.ConvReLU2d,
+    nniq.LinearReLU,
+    nnq.Conv2d,
+    nniq.ConvReLU2d,
+}
+
+class SaveTensorObserver(torch.quantization.observer._ObserverBase):
+    r"""
+    The module is mainly for debug and records the tensor values during runtime.
+
+    Args:
+        dtype: Quantized data type
+        qscheme: Quantization scheme to be used
+        reduce_range: Reduces the range of the quantized data type by 1 bit
+    """
+    def __init__(self, layer_name = ""):
+        super(SaveTensorObserver, self).__init__()
+        self.saved = False
+        self.layer_name = layer_name
+    def forward(self, x):
+        if self.saved:
+           return 
+        if x.is_quantized:
+           INT8_tesor_path = "INT8_tesor/"
+           if not os.path.exists(INT8_tesor_path):
+              os.mkdir(INT8_tesor_path)
+           np.save(INT8_tesor_path + self.layer_name, x.dequantize())
+           print("saved quantized tensor ", self.layer_name)
+        else:
+           FP32_tesor_path = "FP32_tesor/"
+           if not os.path.exists(FP32_tesor_path):
+              os.mkdir(FP32_tesor_path)
+           np.save(FP32_tesor_path + self.layer_name, x)
+           print("saved FP32 tensor ", self.layer_name)
+        self.saved = True
+
+    @torch.jit.export
+    def calculate_qparams(self):
+        raise Exception("calculate_qparams should not be called for SaveTensorObserver")
+
+def add_save_observer_(module, prefix = "", fallback_op_types=DEFAULT_QUANTIZED_OP):
+    r"""Add save tensor observer for some conditional leaf child of the module.
+
+    Args:
+        module: input module
+
+    Return:
+        None, module is modified inplace with added observer modules and forward_hooks
+    """
+    for name, child in module.named_children():
+        if type(child) == nnq.FloatFunctional:
+            if hasattr(child, 'qconfig') and child.qconfig is not None:
+                child.activation_post_process = SaveTensorObserver(prefix+name+".")
+        else:
+            add_save_observer_(child, prefix + name + ".")
+
+    # Insert observers only for leaf nodes, note that this observer is for
+    # the output of the module, for input QuantStub will observe them
+    if len(module._modules) == 0 and (type(module) in DEFAULT_QUANTIZED_OP \
+       or hasattr(module, 'qconfig') and module.qconfig is not None and \
+       not isinstance(module, torch.nn.Sequential) and not isinstance(module,  DeQuantStub) and \
+        not isinstance(module, QuantStub)):
+        print(type(module))
+        print( isinstance(module,  DeQuantStub))
+        # observer and hook will be gone after we swap the module
+        module.add_module('activation_post_process', SaveTensorObserver(prefix))
+        module.register_forward_hook(_observer_forward_hook)
+
+def mse_metric_gap(fp32_tensor, int8_dequantize_tensor):
+    fp32_max  = numpy.max(fp32_tensor)
+    fp32_min  = numpy.min(fp32_tensor)
+    int8_dequantize_max = numpy.max(int8_dequantize_tensor)
+    int8_dequantize_min = numpy.min(int8_dequantize_tensor)
+    fp32_tensor = (fp32_tensor - fp32_min) / (fp32_max - fp32_min)
+    int8_dequantize_tensor = (int8_dequantize_tensor - int8_dequantize_min) / (int8_dequantize_max - int8_dequantize_min)
+    diff_tensor = fp32_tensor - int8_dequantize_tensor
+    euclidean_dist = numpy.sum(diff_tensor ** 2)
+    return euclidean_dist/fp32_tensor.size
+
+def fallback_layer(model, layer_name="", exculde_layers={}):
+    if layer_name in exculde_layers and  not exculde_layers[layer_name]:
+       print(layer_name)
        model.qconfig = None
-       print(prefix)
        for name, sub_model in list(model.named_children()):
            if "dequant" in name or "quant" in name:
-               model._modules[name] = torch.nn.Identity()
+              model._modules[name] = torch.nn.Identity()
+       for name, sub_model in list(model.named_children()):
+           fallback_layer(sub_model, layer_name + name + ".", exculde_layers)
 
-    for name, sub_model in list(model.named_children()):
-       fallback_layers(sub_model, layers, prefix + name + ".")
+def compute_fp32_and_int8_dequantize_gap(model, layer_name="", layer_gap_dict={}):
+    fp32_file = "FP32_tesor/" + layer_name + ".npy"
+    int8_dequantize_file = "INT8_tesor/" + layer_name+".npy"
+    if os.path.exists(fp32_file) and os.path.exists(int8_dequantize_file):
+       print(layer_name)
+       fp32_tensor = numpy.load(fp32_file)
+       int8_dequantize_tensor = numpy.load(int8_dequantize_file)
+       gap = mse_metric_gap(fp32_tensor, int8_dequantize_tensor)
+       layer_gap_dict.update({layer_name:gap})
+       for name, sub_model in model.named_children():
+           compute_fp32_and_int8_dequantize_gap(sub_model, layer_name + name + ".", layer_gap_dict)
 
+def save_model(model, fallback_layers, save_path="quantized_model"):
+    
+
+def quantization_auto_tuning(model, run_fn, test_data=None, calibration_data=None,
+                             metric = "acc", relative_error = 0.01, 
+                             absolute_error = 0.01, relative_err_master = True,
+                             fallback_op_types=DEFAULT_QUANTIZED_OP):
+
+    #run fp32 evaluation to collect accuracy and fp32 tensor
+    model_tmp = copy.deepcopy(model)
+    propagate_qconfig_(model_tmp)
+    print(model_test)
+    add_save_observer_(model_tmp)
+    print(model_tmp)
+    result = run_fn(model_tmp, test_data)
+    fp32_accuracy = result[metric]
+    
+    #run calibration
+    model_tmp = copy.deepcopy(model)
+    prepare(model_tmp, inplace = True)
+    run_fn(model_tmp, calibration_data)
+    
+    #run int8 to collect accuracy and int8 tensor
+    convert(model, inplace=True)
+    result = run_fn(model_tmp, test_data)
+    int8_accuracy = result[metric]
+    
+    need_to_fallback = False
+    if relative_err_master:
+       need_to_fallback = True if int8_accuracy < fp32_accuracy * (1 - relative_error)
+    else:
+       need_to_fallback = True if int8_accuracy < fp32_accuracy * (1 - absolute_error)
+
+    #begin to fallback auto-tuning 
+    if need_to_fallback:
+       #comput distance between fp32 tensor and int8 dequantize tensor
+       layer_gap_dict = {}
+       compute_fp32_and_int8_dequantize_gap(model, "", layer_gap_dict)
+       #sort layer according to above distance to construct auto-tuning search order  
+       sorted_gap = sorted(layer_gap_dict.items(), key=lambda item:item[1], reverse=True)
+       for item in sorted_gap:
+           print(item)
+       
+       cur_int8_accuracy = int8_accuracy 
+       pre_int8_accuracy = int8_accuracy #the currenty best accuacy 
+       len_gap_dict = len(layer_gap_dict)#the maximum search times 
+       fallback_layers = {} #bucket to save fallback layers 
+
+       #fallback auto-tuning
+       while need_to_fallback and  count < len_gap_dict:
+             #fallback layers in the bucket 
+             model_tmp = copy.deepcopy(model)
+             fallback_layers.update({sorted_gap[count % len_gap_dict][0]:False})
+             fallback_layer(model_tmp, "", fallback_layers)
+
+             #calibration and validate the accuracy of 
+             #partitial fallback quantized model 
+             prepare(model_tmp, inplace = True)
+             run_fn(model_tmp, calibration_data)
+             convert(model_tmp, inplace = True)
+             result = run_fn(model_tmp, test_data)
+             cur_int8_metric=result[args.metric]
+             if cur_int8_accuracy > pre_int8_accuracy:
+                pre_int8_accuracy = cur_int8_accuracy
+             else:
+                del fallback_layers[sorted_gap[count][0]]
+                count += 1
+             if relative_err_master:
+                need_to_fallback = True if pre_int8_accuracy < fp32_accuracy * (1 - relative_error)
+             else:
+                need_to_fallback = True if pre_int8_accuracy < fp32_accuracy * (1 - absolute_error)
+       
+       fallback_layer(model, "", fallback_layers)
+
+       #calibration and validate the accuracy of
+       #partitial fallback quantized model
+       prepare(model, inplace = True)
+       run_fn(model, calibration_data)
+       convert(model_tmp, inplace = True)
+       result = run_fn(model, test_data)
+       print("The fallback layers as following:")
+       for layer in fallback_layers.key():
+           print(layer)
+       print("The Int8 accuacy:", result)
+
+       
+    
 
 def main():
     parser = argparse.ArgumentParser()
@@ -524,27 +714,6 @@ def main():
             for name, sub_model in model.named_children():
                 add_layer_name(sub_model, layer_name + name + ".", save_tensor)
 
-        def mse_metric_gap(fp32_tensor, int8_dequantize_tensor):
-            fp32_max  = numpy.max(fp32_tensor)
-            fp32_min  = numpy.min(fp32_tensor)
-            int8_dequantize_max = numpy.max(int8_dequantize_tensor)
-            int8_dequantize_min = numpy.min(int8_dequantize_tensor)
-            fp32_tensor = (fp32_tensor - fp32_min) / (fp32_max - fp32_min)
-            int8_dequantize_tensor = (int8_dequantize_tensor - int8_dequantize_min) / (int8_dequantize_max - int8_dequantize_min)
-            diff_tensor = fp32_tensor - int8_dequantize_tensor
-            euclidean_dist = numpy.sum(diff_tensor ** 2)
-            return euclidean_dist/fp32_tensor.size
-
-        def exculde_layer(model, layer_name="", exculde_layers={}):
-            if layer_name in exculde_layers and  not exculde_layers[layer_name]:
-               print(layer_name)
-               model.qconfig = None
-               for name, sub_model in list(model.named_children()):
-                  if "dequant" in name or "quant" in name:
-                      model._modules[name] = torch.nn.Identity()
-            for name, sub_model in list(model.named_children()):
-                exculde_layer(sub_model, layer_name + name + ".", exculde_layers)
-
  
         from math import log2
         # calculate the kl divergence
@@ -554,17 +723,6 @@ def main():
             elsilon=0.0000001
             return sum(p[i] * log2((p[i]+elsilon)/(q[i]+elsilon)) for i in range(len(p)))
  
-        def compute_fp32_and_int8_dequantize_gap(model, layer_name="", layer_gap_dict={}):
-            fp32_file = layer_name+".npy"
-            int8_dequantize_file = "dequantize." + layer_name+".npy"
-            if os.path.exists(fp32_file) and os.path.exists(int8_dequantize_file):
-                print(layer_name)
-                fp32_tensor = numpy.load(fp32_file)
-                int8_dequantize_tensor = numpy.load(int8_dequantize_file)
-                gap = mse_metric_gap(fp32_tensor, int8_dequantize_tensor)
-                layer_gap_dict.update({layer_name:gap})
-            for name, sub_model in model.named_children():
-                compute_fp32_and_int8_dequantize_gap(sub_model, layer_name + name + ".", layer_gap_dict)
  
         for checkpoint in checkpoints:
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
@@ -574,6 +732,12 @@ def main():
             if args.do_fp32_inference:
                model = model_class.from_pretrained(checkpoint)
                model.to(args.device)
+               import copy
+               model_test = copy.deepcopy(model)
+               propagate_qconfig_(model_test)
+               print(model_test)
+               add_save_observer_(model_test)
+               print(model_test)
                layer_gap_dict = {}
                #import numpy
                #compute_fp32_and_int8_dequantize_gap(model, "", layer_gap_dict)
@@ -583,7 +747,7 @@ def main():
                #break 
                add_layer_name(model, "", True)
                #with torch.autograd.profiler.profile() as prof:
-               result = evaluate(args, model, tokenizer, prefix=global_step)
+               result = evaluate(args, model_test, tokenizer, prefix=global_step)
                fp32_metric = result[args.metric]
                result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
                results.update(result)
