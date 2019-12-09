@@ -337,6 +337,29 @@ DEFAULT_QUANTIZED_OP = {
     nniq.ConvReLU2d,
 }
 
+class DequantQuantWrapper(nn.Module):
+    r"""A wrapper class that wraps the input module, adds DeQuantStub and
+    QuantStub and surround the call to module with call to dequant and quant
+    modules.
+
+    This is used by the fallback utility functions to add the dequant and
+    quant modules, before `convert` function `QuantStub` will just be observer,
+    it observes the input tensor, after `convert`, `QuantStub`
+    will be swapped to `nnq.Quantize` which does actual quantization. Similarly
+    for `DeQuantStub`.
+    """
+    def __init__(self, module):
+        super(DequantQuantWrapper, self).__init__()
+        self.add_module('quant', QuantStub(qconfig))
+        self.add_module('dequant', DeQuantStub())
+        self.add_module('module', module)
+        self.train(module.training)
+
+    def forward(self, X):
+        X = self.dequant(X)
+        X = self.module(X)
+        return self.quant(X)
+
 class SaveTensorObserver(torch.quantization.observer._ObserverBase):
     r"""
     The module is mainly for debug and records the tensor values during runtime.
@@ -411,14 +434,14 @@ def mse_metric_gap(fp32_tensor, int8_dequantize_tensor):
     return euclidean_dist/fp32_tensor.size
 
 def fallback_layer(model, layer_name="", exculde_layers={}):
-    if layer_name in exculde_layers and  not exculde_layers[layer_name]:
-       print(layer_name)
-       model.qconfig = None
-       for name, sub_model in list(model.named_children()):
-           if "dequant" in name or "quant" in name:
-              model._modules[name] = torch.nn.Identity()
-       for name, sub_model in list(model.named_children()):
-           fallback_layer(sub_model, layer_name + name + ".", exculde_layers)
+    for name, sub_model in list(model.named_children()):
+        sub_model_layer_name = layer_name + name + "."
+        if sub_model_layer_name in exculde_layers:
+           sub_model.qconfig = None
+           model._modules[name] = DequantQuantWrapper(sub_model) 
+        else:
+           for sub_model_name, sub_sub_model in list(sub_model.named_children()):
+               fallback_layer(sub_sub_model, sub_model_layer_name, exculde_layers)
 
 def compute_fp32_and_int8_dequantize_gap(model, layer_name="", layer_gap_dict={}):
     fp32_file = "FP32_tesor/" + layer_name + ".npy"
@@ -433,7 +456,8 @@ def compute_fp32_and_int8_dequantize_gap(model, layer_name="", layer_gap_dict={}
            compute_fp32_and_int8_dequantize_gap(sub_model, layer_name + name + ".", layer_gap_dict)
 
 def save_quantized_model(model, fallback_layers, save_directory="quantized_model", save_config = False):
-    
+    if not os.path.exists(save_directory):
+       os.mkdir(save_directory)
     assert os.path.isdir(save_directory), "Saving path should be a directory where the model and configuration can be saved"
     # Save qconfig info 
     qconfig_file = os.path.join(save_directory, "qconfig.json")
@@ -473,6 +497,7 @@ def quantization_auto_tuning(model, run_fn, test_data=None, calibration_data=Non
     
     #run int8 to collect accuracy and int8 tensor
     convert(model, inplace=True)
+    add_save_observer_(model_tmp)
     result = run_fn(model_tmp, test_data)
     int8_accuracy = result[metric]
     
@@ -533,7 +558,8 @@ def quantization_auto_tuning(model, run_fn, test_data=None, calibration_data=Non
        for layer in fallback_layers.key():
            print(layer)
        print("The Int8 accuacy:", result)
-
+       save_quantized_model(model, fallback_layers=fallback_layers, 
+                            save_directory="quantized_model", save_config = True)
        
     
 
