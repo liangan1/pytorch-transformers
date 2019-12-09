@@ -432,8 +432,25 @@ def compute_fp32_and_int8_dequantize_gap(model, layer_name="", layer_gap_dict={}
        for name, sub_model in model.named_children():
            compute_fp32_and_int8_dequantize_gap(sub_model, layer_name + name + ".", layer_gap_dict)
 
-def save_model(model, fallback_layers, save_path="quantized_model"):
+def save_quantized_model(model, fallback_layers, save_directory="quantized_model", save_config = False):
     
+    assert os.path.isdir(save_directory), "Saving path should be a directory where the model and configuration can be saved"
+    # Save qconfig info 
+    qconfig_file = os.path.join(save_directory, "qconfig.json")
+    with open(qconfig_file, "w") as qconfig_output:
+         json.dump(fallback_layers, qconfig_output)
+    
+    # Save configuration file (reference to pytorch_transformers repo)
+    if save_config:
+       config_file = os.path.join(save_directory, "config.json")
+       with open(json_file_path, "w", encoding='utf-8') as writer:
+            output = copy.deepcopy(model.__dict__)
+            json_str = json.dumps(output, indent=2, sort_keys=True) + "\n"
+            writer.write(json_str)
+    # Only save the model it-self if we are using distributed training
+    model_to_save = model.module if hasattr(model, 'module') else model
+    qconfig_file = os.path.join(save_directory, "pytorch_model.bin")
+    torch.save(model_to_save.state_dict(), output_model_file)
 
 def quantization_auto_tuning(model, run_fn, test_data=None, calibration_data=None,
                              metric = "acc", relative_error = 0.01, 
