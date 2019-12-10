@@ -645,15 +645,16 @@ def quantization_auto_tuning(model, run_fn, run_args, run_calibration,
                  break
               elif not relative_err_master and cur_int8_accuracy >= fp32_accuracy * (1 - absolute_error):
                  break 
-          
+       
        if performance_fine_tuning:
           fallback_layers = fined_fallback_layers
-
+       
+       propagate_qconfig_(model)
        fallback_layer(model, "", fallback_layers)
        
        #calibration and validate the accuracy of
        #partitial fallback quantized model
-       prepare(model, inplace = True)
+       add_observer_(model)
        run_calibration(model, calibration_args)
        convert(model, inplace = True)
        result = run_fn(model, run_args)
