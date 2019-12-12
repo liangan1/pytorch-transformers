@@ -30,7 +30,7 @@ from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
 from torch.utils.data.distributed import DistributedSampler
 from tensorboardX import SummaryWriter
 from tqdm import tqdm, trange
-
+from pytorch_quantization_tool import *
 from pytorch_transformers import (WEIGHTS_NAME, BertConfig,
                                   BertForSequenceClassification, BertTokenizer,
                                   RobertaConfig,
@@ -462,8 +462,8 @@ def fallback_layer(model, layer_name="", exculde_layers={}):
     for name, sub_model in list(model.named_children()):
         sub_model_layer_name = layer_name + name + "."
         if sub_model_layer_name in exculde_layers:
+           print("fallback_layer:", sub_model_layer_name)
            model._modules[name] = DequantQuantWrapper(sub_model) 
-           print("fallback_layer:", sub_model_layer_name, model)
         else:
            fallback_layer(sub_model, sub_model_layer_name, exculde_layers)
 
@@ -509,20 +509,19 @@ def save_quantized_model(model, fallback_layers, save_directory="quantized_model
     qconfig_file = os.path.join(save_directory, "qconfig.json")
     with open(qconfig_file, "w") as qconfig_output:
          json.dump(fallback_layers, qconfig_output)
-    
     # Save configuration file (reference to pytorch_transformers repo)
     if save_config:
        config_file = os.path.join(save_directory, "config.json")
-       with open(json_file_path, "w", encoding='utf-8') as writer:
-            output = copy.deepcopy(model.__dict__)
+       with open(config_file, "w", encoding='utf-8') as writer:
+            output = copy.deepcopy(model.config.__dict__)
             json_str = json.dumps(output, indent=2, sort_keys=True) + "\n"
             writer.write(json_str)
     # Only save the model it-self if we are using distributed training
     model_to_save = model.module if hasattr(model, 'module') else model
-    qconfig_file = os.path.join(save_directory, "pytorch_model.bin")
+    output_model_file = os.path.join(save_directory, "pytorch_model.bin")
     torch.save(model_to_save.state_dict(), output_model_file)
 
-def quantization_auto_tuning(model, run_fn, run_args, run_calibration, 
+def quantization_auto_tuning_1(model, run_fn, run_args, run_calibration, 
                              calibration_args, metric = "top-1", relative_error = 0.01, 
                              absolute_error = 0.01, relative_err_master = True,
                              fallback_op_types=DEFAULT_QUANTIZED_OP,
@@ -568,7 +567,8 @@ def quantization_auto_tuning(model, run_fn, run_args, run_calibration,
     add_save_observer_(model_tmp)
     result = run_fn(model_tmp, run_args)
     int8_accuracy = result[metric]
-    
+    save_quantized_model(model_tmp, {},
+                            save_directory="quantized_model", save_config = True)  
     need_to_fallback = False
     if relative_err_master:
        need_to_fallback = True if int8_accuracy < fp32_accuracy * (1 - relative_error) else False
@@ -610,14 +610,17 @@ def quantization_auto_tuning(model, run_fn, run_args, run_calibration,
                 accuracy_improvment_dict.update(
                        {sorted_gap[count % len_gap_dict][0]:
                         cur_int8_accuracy - pre_int8_accuracy })
+                print("accuracy_improvment_dict", accuracy_improvment_dict)
                 pre_int8_accuracy = cur_int8_accuracy
              else:
-                del fallback_layers[sorted_gap[count][0]]
-                count += 1
+                del fallback_layers[sorted_gap[count % len_gap_dict][0]]
+             count += 1
              if relative_err_master:
                 need_to_fallback = True if pre_int8_accuracy < fp32_accuracy * (1 - relative_error) else False
              else:
                 need_to_fallback = True if pre_int8_accuracy < fp32_accuracy * (1 - absolute_error) else False
+       print(performance_fine_tuning)
+       performance_fine_tuning=True
        if performance_fine_tuning:
           #furtherly search the  subset of fallback_layers to improve performance
           fined_fallback_layers = {}
@@ -864,7 +867,7 @@ def main():
             run_args.do_calibration = False
             calibration_args = args  
             prefix = "" 
-            quantization_auto_tuning(model, evaluate, run_args, evaluate, calibration_args, metric="acc") 
+            quantization_auto_tuning(model, evaluate, run_args, evaluate, calibration_args, metric="f1") 
 
 if __name__ == "__main__":
     main()
