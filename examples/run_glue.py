@@ -485,6 +485,10 @@ def main():
             model = model_class.from_pretrained(checkpoint)
             model.to(args.device)
             result = evaluate(args, model, tokenizer, prefix=global_step)
+            quantized_model = torch.quantization.quantize_dynamic(
+                              model, {torch.nn.Linear}, dtype=torch.qint8)
+            print(quantized_model)
+            result = evaluate(args, quantized_model, tokenizer, prefix=global_step)
             result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
             results.update(result)
 
