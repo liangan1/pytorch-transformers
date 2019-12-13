@@ -20,7 +20,7 @@ NUM_THREAD=$NUM_CORES
 NUM_NUMA=$((`lscpu | grep 'NUMA node(s)'|awk '{print $3}' ` - 1))
 export KMP_AFFINITY=granularity=fine,noduplicates,compact,1,0
 ARGS=""
-BATCH_SIZE=16
+BATCH_SIZE=8
 if [[ "$1" == "--single" ]]; then
   echo "### using single batch size"
   BATCH_SIZE=1
