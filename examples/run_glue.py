@@ -30,7 +30,7 @@ from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
 from torch.utils.data.distributed import DistributedSampler
 from tensorboardX import SummaryWriter
 from tqdm import tqdm, trange
-from pytorch_quantization_tool import *
+#from pytorch_quantization_tool import *
 from pytorch_transformers import (WEIGHTS_NAME, BertConfig,
                                   BertForSequenceClassification, BertTokenizer,
                                   RobertaConfig,
@@ -49,7 +49,7 @@ from utils_glue import (compute_metrics, convert_examples_to_features,
 from torch.quantization import \
     prepare, convert, propagate_qconfig_, add_observer_
 from torch.quantization import \
-    QuantWrapper, QuantStub, DeQuantStub, default_qconfig, default_per_channel_qconfig
+    QuantWrapper, QuantStub, DeQuantStub, default_qconfig, default_per_channel_qconfig, default_dynamic_qconfig
 
 logger = logging.getLogger(__name__)
 
@@ -458,12 +458,17 @@ def fallback_layer(model, layer_name="", exculde_layers={}):
         layer_name: model layer name format is : xxx.xxx.xxx
         : flag to save, only save the first one batch tensor
     """
-
+    need_identity = False
     for name, sub_model in list(model.named_children()):
         sub_model_layer_name = layer_name + name + "."
         if sub_model_layer_name in exculde_layers:
            print("fallback_layer:", sub_model_layer_name)
-           model._modules[name] = DequantQuantWrapper(sub_model) 
+           need_identity = True
+           #model._modules[name] = DequantQuantWrapper(sub_model) 
+           sub_model.qconfig = default_dynamic_qconfig
+           for name_tmp, sub_model_tmp in list(model.named_children()):
+               if (isinstance(sub_model_tmp, QuantStub) or isinstance(sub_model_tmp, DeQuantStub)):
+                   model._modules[name_tmp]=torch.nn.Identity()
         else:
            fallback_layer(sub_model, sub_model_layer_name, exculde_layers)
 
@@ -521,7 +526,7 @@ def save_quantized_model(model, fallback_layers, save_directory="quantized_model
     output_model_file = os.path.join(save_directory, "pytorch_model.bin")
     torch.save(model_to_save.state_dict(), output_model_file)
 
-def quantization_auto_tuning_1(model, run_fn, run_args, run_calibration, 
+def quantization_auto_tuning(model, run_fn, run_args, run_calibration, 
                              calibration_args, metric = "top-1", relative_error = 0.01, 
                              absolute_error = 0.01, relative_err_master = True,
                              fallback_op_types=DEFAULT_QUANTIZED_OP,
@@ -579,7 +584,7 @@ def quantization_auto_tuning_1(model, run_fn, run_args, run_calibration,
     if need_to_fallback:
        #comput distance between fp32 tensor and int8 dequantize tensor
        layer_gap_dict = {}
-       compute_fp32_and_int8_dequantize_gap(model, "", layer_gap_dict)
+       #compute_fp32_and_int8_dequantize_gap(model, "", layer_gap_dict)
        #sort layer according to above distance to construct auto-tuning search order  
        sorted_gap = sorted(layer_gap_dict.items(), key=lambda item:item[1], reverse=True)
        for item in sorted_gap:
@@ -587,16 +592,25 @@ def quantization_auto_tuning_1(model, run_fn, run_args, run_calibration,
        
        cur_int8_accuracy = int8_accuracy 
        pre_int8_accuracy = int8_accuracy #the currenty best accuacy 
-       len_gap_dict = len(layer_gap_dict)#the maximum search times 
+       len_gap_dict = 12 #len(layer_gap_dict)#the maximum search times 
        fallback_layers = {} #bucket to save fallback layers 
        accuracy_improvment_dict = {}       
        count = 0
+       sorted_gap = ["bert.encoder.layer.11.output.dense.", "bert.encoder.layer.10.output.dense.",
+                     "bert.encoder.layer.9.output.dense.", "bert.encoder.layer.8.output.dense.",
+                     "bert.encoder.layer.7.output.dense.", "bert.encoder.layer.6.output.dense.",
+                     "bert.encoder.layer.5.output.dense.", "bert.encoder.layer.4.output.dense.",
+                     "bert.encoder.layer.3.output.dense.", "bert.encoder.layer.2.output.dense.",
+                     "bert.encoder.layer.1.output.dense.", "bert.encoder.layer.0.output.dense."]
+       fallback_layers = ["bert.encoder.layer.9.output.dense.", "bert.encoder.layer.10.output.dense."]
+                    
        #fallback auto-tuning
        while need_to_fallback and  count < len_gap_dict:
              #fallback layers in the bucket 
              model_tmp = copy.deepcopy(model)
              propagate_qconfig_(model_tmp)
-             fallback_layers.update({sorted_gap[count % len_gap_dict][0]:False})
+             #fallback_layers.update({sorted_gap[count % len_gap_dict][0]:False})
+             #fallback_layers.update({sorted_gap[count % len_gap_dict]:False})
              fallback_layer(model_tmp, "", fallback_layers)
 
              #calibration and validate the accuracy of 
@@ -604,6 +618,7 @@ def quantization_auto_tuning_1(model, run_fn, run_args, run_calibration,
              add_observer_(model_tmp) 
              run_calibration(model_tmp, calibration_args)
              convert(model_tmp, inplace = True)
+             print(model_tmp)
              result = run_fn(model_tmp, run_args)
              cur_int8_accuracy=result[metric]
              if cur_int8_accuracy > pre_int8_accuracy:
@@ -613,12 +628,15 @@ def quantization_auto_tuning_1(model, run_fn, run_args, run_calibration,
                 print("accuracy_improvment_dict", accuracy_improvment_dict)
                 pre_int8_accuracy = cur_int8_accuracy
              else:
-                del fallback_layers[sorted_gap[count % len_gap_dict][0]]
+                pass
+                #del fallback_layers[sorted_gap[count % len_gap_dict][0]]
+                #del fallback_layers[sorted_gap[count % len_gap_dict]]
              count += 1
              if relative_err_master:
                 need_to_fallback = True if pre_int8_accuracy < fp32_accuracy * (1 - relative_error) else False
              else:
                 need_to_fallback = True if pre_int8_accuracy < fp32_accuracy * (1 - absolute_error) else False
+             break
        print(performance_fine_tuning)
        performance_fine_tuning=True
        if performance_fine_tuning:

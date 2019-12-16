@@ -44,13 +44,13 @@ export $KMP_SETTING
 echo -e "### using OMP_NUM_THREADS=$TOTAL_CORES"
 echo -e "### using $KMP_SETTING"
 echo -e "### using ARGS=$ARGS\n"
-for task in "QNLI" "MRPC" 
+for task in  "MRPC" 
 do
 
-GLUE_DIR=/lustre/dataset/glue_data
+GLUE_DIR=~/glue_data
 TASK_NAME=${task}
 
-OUTPUT=${GLUE_DIR}/weights/${TASK_NAME}_output/
+OUTPUT=${TASK_NAME}_output/
 if [[ -d "$OUTPUT" ]]; then
   echo "### using model file from $OUTPUT"
 else
@@ -59,7 +59,7 @@ else
 fi
 
 $PREFIX python ./examples/run_glue.py --model_type bert \
-    --model_name_or_path bert-large-uncased \
+    --model_name_or_path bert-base-uncased \
     --task_name ${TASK_NAME} \
     --do_eval \
     --do_lower_case \
