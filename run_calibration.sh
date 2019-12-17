@@ -44,7 +44,7 @@ export $KMP_SETTING
 echo -e "### using OMP_NUM_THREADS=$TOTAL_CORES"
 echo -e "### using $KMP_SETTING"
 echo -e "### using ARGS=$ARGS\n"
-for task in  "MRPC" 
+for task in  "RTE" 
 do
 
 GLUE_DIR=~/glue_data
