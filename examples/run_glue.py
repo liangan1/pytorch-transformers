@@ -520,7 +520,7 @@ def main():
             quantized_model_directory = "quantized_model_"+args.task_name
             prefix = "" 
             quantization_auto_tuning(model, evaluate, run_args, evaluate, calibration_args, 
-                                    tuing_strategy="euclidean", quantized_model_directory=quantized_model_directory, metric="acc", max_split_quantized=True) 
+                                    tuing_strategy="bottom-up", quantized_model_directory=quantized_model_directory, metric="acc", max_split_quantized=True) 
             prepare_fallback_model(model, quantized_model_directory=quantized_model_directory, max_split_quantized=True)
             print(model)
             evaluate(model, run_args)

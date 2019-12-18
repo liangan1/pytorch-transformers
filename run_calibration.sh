@@ -50,7 +50,7 @@ do
 GLUE_DIR=~/glue_data
 TASK_NAME=${task}
 
-OUTPUT=${TASK_NAME}_output/
+OUTPUT=${GLUE_DIR}/base_weights/${TASK_NAME}_output/
 if [[ -d "$OUTPUT" ]]; then
   echo "### using model file from $OUTPUT"
 else

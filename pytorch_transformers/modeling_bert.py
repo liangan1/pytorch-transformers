@@ -1006,10 +1006,10 @@ class BertForSequenceClassification(BertPreTrainedModel):
         self.num_labels = config.num_labels
         self.bert = BertModel(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        #self.quant = QuantStub()
-        #self.dequant = DeQuantStub()
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
         self.classifier = nn.Linear(config.hidden_size, self.config.num_labels)
-        #self.qconfig = cur_qconfig
+        self.qconfig = cur_qconfig
 
         self.apply(self.init_weights)
 
@@ -1020,9 +1020,9 @@ class BertForSequenceClassification(BertPreTrainedModel):
         pooled_output = outputs[1]
 
         pooled_output = self.dropout(pooled_output)
-        #pooled_output = self.quant(pooled_output)
+        pooled_output = self.quant(pooled_output)
         logits = self.classifier(pooled_output)
-        #logits = self.dequant(logits)
+        logits = self.dequant(logits)
         outputs = (logits,) + outputs[2:]  # add hidden states and attention if they are here
 
         if labels is not None:
