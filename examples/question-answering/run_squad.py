@@ -27,7 +27,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
+import torch.distributed  as dist
 from tqdm import tqdm, trange
+
 
 from transformers import (
     MODEL_FOR_QUESTION_ANSWERING_MAPPING,
@@ -122,10 +124,13 @@ def train(args, train_dataset, model, tokenizer):
 
     # Distributed training (should be after apex fp16 initialization)
     if args.local_rank != -1:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True
-        )
-
+        if args.no_cuda:
+            model = torch.nn.parallel.DistributedDataParallel( model, find_unused_parameters=True
+            )
+        else:
+            model = torch.nn.parallel.DistributedDataParallel(
+                model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True
+            )
     # Train!
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(train_dataset))
@@ -166,7 +171,6 @@ def train(args, train_dataset, model, tokenizer):
     )
     # Added here for reproductibility
     set_seed(args)
-
     for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
@@ -313,6 +317,7 @@ def evaluate(args, model, tokenizer, prefix=""):
                     inputs.update(
                         {"langs": (torch.ones(batch[0].shape, dtype=torch.int64) * args.lang_id).to(args.device)}
                     )
+
             outputs = model(**inputs)
 
         for i, feature_index in enumerate(feature_indices):
@@ -640,6 +645,11 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
 
+    parser.add_argument("--distributed", action='store_true', default=False, help="whether run with distribut ")
+    parser.add_argument('--dist-backend', default='ccl', type=str,
+                        help='distributed backend') 
+
+    parser.add_argument("--world_size", type=int, default=-1, help="world size for distributed training on cpus")
     parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for distributed training on gpus")
     parser.add_argument(
         "--fp16",
@@ -653,11 +663,29 @@ def main():
         help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
         "See details at https://nvidia.github.io/apex/amp.html",
     )
+    parser.add_argument("--url", type=str, default="tcp://127.0.0.1:9999", help="url for distributed data parallel training.")
     parser.add_argument("--server_ip", type=str, default="", help="Can be used for distant debugging.")
     parser.add_argument("--server_port", type=str, default="", help="Can be used for distant debugging.")
 
     parser.add_argument("--threads", type=int, default=1, help="multiple threads for converting example to features")
+    parser.add_argument('--ipex', action='store_true', default=False,
+                        help='enable Intel_PyTorch_Extension')
+    parser.add_argument('--dnnl', action='store_true', default=False,
+                        help='enable Intel_PyTorch_Extension auto dnnl path')
+    parser.add_argument('--mix-precision', action='store_true', default=False,
+                        help='enable ipex mix precision')
+
+    
     args = parser.parse_args()
+    
+    if args.ipex:
+        import intel_pytorch_extension as ipex
+        if args.dnnl:
+            ipex.core.enable_auto_dnnl()
+        else:
+            ipex.core.disable_auto_dnnl()
+        if args.mix_precision:
+            ipex.core.enable_mix_bf16_fp32()
 
     if args.doc_stride >= args.max_seq_length - args.max_query_length:
         logger.warning(
@@ -687,8 +715,18 @@ def main():
         ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
         ptvsd.wait_for_attach()
 
+    if args.distributed and args.dist_backend == "ccl":
+        import torch_ccl
+        os.environ['RANK'] = os.environ.get('PMI_RANK', -1)
+        os.environ['WORLD_SIZE'] = os.environ.get('PMI_SIZE', -1)
+ 
     # Setup CUDA, GPU & distributed training
-    if args.local_rank == -1 or args.no_cuda:
+    if args.distributed and not torch.torch.cuda.is_available():
+        torch.distributed.init_process_group(backend=args.dist_backend)
+        args.local_rank = dist.get_rank()
+        args.n_gpu = 0
+        args.no_cuda = True
+    elif args.local_rank == -1:
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
         args.n_gpu = 0 if args.no_cuda else torch.cuda.device_count()
     else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
@@ -696,8 +734,10 @@ def main():
         device = torch.device("cuda", args.local_rank)
         torch.distributed.init_process_group(backend="nccl")
         args.n_gpu = 1
+    
+    if args.ipex:
+        device = torch.device("dpcpp")
     args.device = device
-
     # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
@@ -741,9 +781,7 @@ def main():
     if args.local_rank == 0:
         # Make sure only the first process in distributed training will download model & vocab
         torch.distributed.barrier()
-
     model.to(args.device)
-
     logger.info("Training/evaluation parameters %s", args)
 
     # Before we do anything with models, we want to ensure that we get fp16 execution of torch.einsum if args.fp16 is set.
