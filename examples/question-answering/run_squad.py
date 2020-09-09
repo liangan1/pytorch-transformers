@@ -685,8 +685,7 @@ def main():
         else:
             ipex.core.disable_auto_dnnl()
         if args.mix_precision:
-            ipex.core.enable_mix_bf16_fp32()
-
+            ipex.enable_auto_optimization(mixed_dtype=torch.bfloat16, train=True)
     if args.doc_stride >= args.max_seq_length - args.max_query_length:
         logger.warning(
             "WARNING - You've set a doc stride which may be superior to the document length in some "
@@ -726,6 +725,7 @@ def main():
         args.local_rank = dist.get_rank()
         args.n_gpu = 0
         args.no_cuda = True
+        device = torch.device("cpu")
     elif args.local_rank == -1:
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
         args.n_gpu = 0 if args.no_cuda else torch.cuda.device_count()
