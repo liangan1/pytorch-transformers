@@ -685,7 +685,7 @@ def main():
         else:
             ipex.core.disable_auto_dnnl()
         if args.mix_precision:
-            ipex.enable_auto_optimization(mixed_dtype=torch.bfloat16, train=True)
+            ipex.enable_auto_mixed_precision(mixed_dtype=torch.bfloat16, train=True)
     if args.doc_stride >= args.max_seq_length - args.max_query_length:
         logger.warning(
             "WARNING - You've set a doc stride which may be superior to the document length in some "
