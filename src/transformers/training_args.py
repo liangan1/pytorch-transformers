@@ -445,6 +445,10 @@ class TrainingArguments:
         default=True, metadata={"help": "Whether or not to pin memory for DataLoader."}
     )
     _n_gpu: int = field(init=False, repr=False, default=-1)
+    ipex:  bool = field(default=False, metadata={"help": "enable Intel_PyTorch_Extension"})
+    dnnl:  bool = field(default=False, metadata={"help": "enable Intel_PyTorch_Extension auto dnnl path"})
+    mix_precision:  bool = field(default=False, metadata={"help": "enable ipex mix precision"})
+    jit:  bool = field(default=False, metadata={"help": "nable Intel_PyTorch_Extension JIT path"})
 
     def __post_init__(self):
         if self.output_dir is None and os.getenv("SM_OUTPUT_DATA_DIR") is None:
@@ -524,7 +528,10 @@ class TrainingArguments:
     @torch_required
     def _setup_devices(self) -> "torch.device":
         logger.info("PyTorch: setting up devices")
-        if self.no_cuda:
+        if self.ipex:
+            import intel_pytorch_extension as ipex
+            device = torch.device(ipex.DEVICE)
+        elif self.no_cuda:
             device = torch.device("cpu")
             self._n_gpu = 0
         elif is_torch_tpu_available():

@@ -232,6 +232,17 @@ class Trainer:
             output_dir = "tmp_trainer"
             logger.info(f"No `TrainingArguments` passed, using `output_dir={output_dir}`.")
             args = TrainingArguments(output_dir=output_dir)
+        if args.ipex:
+            import intel_pytorch_extension as ipex
+            if args.dnnl:
+                ipex.core.enable_auto_dnnl()
+            else:
+                ipex.core.disable_auto_dnnl()
+            if args.mix_precision:
+                ipex.enable_auto_mixed_precision(mixed_dtype=torch.bfloat16, train=True)
+                # jit path only enabled for inference
+            if args.jit and args.evaluate:
+                ipex.core.enable_jit_opt()  
         self.args = args
         # Seed must be set before instantiating the model when using model
         set_seed(self.args.seed)
@@ -263,8 +274,8 @@ class Trainer:
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.tokenizer = tokenizer
-
-        # Model parallel
+        
+        # Model paralle`l
         if not self.is_model_parallel:
             model = model.to(args.device)
         else:
