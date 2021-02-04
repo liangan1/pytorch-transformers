@@ -449,7 +449,7 @@ class TrainingArguments:
     dnnl:  bool = field(default=False, metadata={"help": "enable Intel_PyTorch_Extension auto dnnl path"})
     mix_precision:  bool = field(default=False, metadata={"help": "enable ipex mix precision"})
     jit:  bool = field(default=False, metadata={"help": "nable Intel_PyTorch_Extension JIT path"})
-
+    enable_profiling:  bool = field(default=False, metadata={"help": "enable pytorch profiling"})
     def __post_init__(self):
         if self.output_dir is None and os.getenv("SM_OUTPUT_DATA_DIR") is None:
             raise ValueError(

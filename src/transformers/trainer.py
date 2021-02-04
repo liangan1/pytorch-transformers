@@ -1627,28 +1627,34 @@ class Trainer:
             self._past = None
 
         self.callback_handler.eval_dataloader = dataloader
+        with torch.autograd.profiler.profile(self.args.enable_profiling) as prof:
+            for step, inputs in enumerate(dataloader):
+                #if step == 2:
+                #    break
+                loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+                if loss is not None:
+                    losses = loss.repeat(batch_size)
+                    losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
+                if logits is not None:
+                    preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
+                if labels is not None:
+                    labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
+                self.control = self.callback_handler.on_prediction_step(self.args, self.state, self.control)
 
-        for step, inputs in enumerate(dataloader):
-            loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
-            if loss is not None:
-                losses = loss.repeat(batch_size)
-                losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
-            if logits is not None:
-                preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
-            if labels is not None:
-                labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
-            self.control = self.callback_handler.on_prediction_step(self.args, self.state, self.control)
+                # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
+                if self.args.eval_accumulation_steps is not None and (step + 1) % self.args.eval_accumulation_steps == 0:
+                    eval_losses_gatherer.add_arrays(self._gather_and_numpify(losses_host, "eval_losses"))
+                    if not prediction_loss_only:
+                        preds_gatherer.add_arrays(self._gather_and_numpify(preds_host, "eval_preds"))
+                        labels_gatherer.add_arrays(self._gather_and_numpify(labels_host, "eval_label_ids"))
 
-            # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
-            if self.args.eval_accumulation_steps is not None and (step + 1) % self.args.eval_accumulation_steps == 0:
-                eval_losses_gatherer.add_arrays(self._gather_and_numpify(losses_host, "eval_losses"))
-                if not prediction_loss_only:
-                    preds_gatherer.add_arrays(self._gather_and_numpify(preds_host, "eval_preds"))
-                    labels_gatherer.add_arrays(self._gather_and_numpify(labels_host, "eval_label_ids"))
-
-                # Set back to None to begin a new accumulation
-                losses_host, preds_host, labels_host = None, None, None
-
+                    # Set back to None to begin a new accumulation
+                    losses_host, preds_host, labels_host = None, None, None
+        if self.args.enable_profiling:
+            with open("pytorch-transformer.prof", "w") as prof_f:
+                 prof_f.write(prof.key_averages().table(sort_by="cpu_time_total"))
+                 prof.export_chrome_trace("./pytorch-transformer.prof")
+                 print(prof.key_averages().table(sort_by="cpu_time_total"))
         if self.args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of the evaluation loop
             delattr(self, "_past")
