@@ -460,7 +460,6 @@ class Trainer:
         else:
             num_processes = 1
             process_index = 0
-
         # Build the sampler.
         if self.args.group_by_length:
             if num_processes <= 1:
@@ -810,11 +809,14 @@ class Trainer:
                 find_unused_parameters = not getattr(model.config, "gradient_checkpointing", False)
             else:
                 find_unused_parameters = True
-            model = torch.nn.parallel.DistributedDataParallel(
-                model,
-                device_ids=[self.args.local_rank],
-                output_device=self.args.local_rank,
-                find_unused_parameters=find_unused_parameters,
+            if self.args.n_gpu == -1:
+                model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=find_unused_parameters) 
+            else:
+                model = torch.nn.parallel.DistributedDataParallel(
+                    model,
+                    device_ids=[self.args.local_rank],
+                    output_device=self.args.local_rank,
+                    find_unused_parameters=find_unused_parameters,
             )
 
         # for the rest of this function `model` is the outside model, whether it was wrapped or not
@@ -1629,7 +1631,7 @@ class Trainer:
         self.callback_handler.eval_dataloader = dataloader
         with torch.autograd.profiler.profile(self.args.enable_profiling) as prof:
             for step, inputs in enumerate(dataloader):
-                #if step == 2:
+                #if step == 20:
                 #    break
                 loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
                 if loss is not None:

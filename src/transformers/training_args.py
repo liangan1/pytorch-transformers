@@ -450,6 +450,20 @@ class TrainingArguments:
     mix_precision:  bool = field(default=False, metadata={"help": "enable ipex mix precision"})
     jit:  bool = field(default=False, metadata={"help": "nable Intel_PyTorch_Extension JIT path"})
     enable_profiling:  bool = field(default=False, metadata={"help": "enable pytorch profiling"})
+    distributed_training:  bool = field(default=False, metadata={"help": "enable distributed training"})
+    use_mpi_launcher:  bool = field(default=False, metadata={"help": "use mpi to launch multi-process"})
+    dist_backend: str = field(
+                    default="ccl",
+                            metadata={"help": "The backend to be used for distributed training.", "choices": ["ccl", "mpi", "gloo"]},
+                                )
+    master_addr: str = field(
+                    default="127.0.0.1",
+                            metadata={"help": "The master address to be used for distributed training on CPU."})
+    master_port: str = field(
+                                default="29500",
+                    metadata={"help": "The master port to be used for distributed training on CPU."})
+
+
     def __post_init__(self):
         if self.output_dir is None and os.getenv("SM_OUTPUT_DATA_DIR") is None:
             raise ValueError(
@@ -531,6 +545,14 @@ class TrainingArguments:
         if self.ipex:
             import intel_pytorch_extension as ipex
             device = torch.device(ipex.DEVICE)
+            if self.distributed_training:
+                if self.use_mpi_launcher:
+                    os.environ['RANK'] = os.environ.get('PMI_RANK', "-1")
+                    os.environ['WORLD_SIZE'] = os.environ.get('PMI_SIZE', "1")
+                os.environ['MASTER_ADDR'] = self.master_addr
+                os.environ['MASTER_PORT'] = self.master_port
+                torch.distributed.init_process_group(backend=self.dist_backend)
+                self.local_rank = torch.distributed.get_rank()
         elif self.no_cuda:
             device = torch.device("cpu")
             self._n_gpu = 0
